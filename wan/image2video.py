@@ -14,6 +14,7 @@ import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
+from einops import rearrange
 from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
@@ -223,14 +224,15 @@ class WanI2V:
             device=self.device,
         )
 
-        msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
-        msk[:, 1:] = 0
-        msk = torch.concat([
-            torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-        ],
-                           dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-        msk = msk.transpose(1, 2)[0]
+        def build_mask(lat_h, lat_w, frame_num, repeats=4):
+            msk = torch.zeros(repeats + (frame_num - 1), lat_h, lat_w, device="cuda")
+            msk[:repeats] = 1
+
+            msk = rearrange(msk, "(g r) h w -> r g h w", r=repeats)
+
+            return msk
+
+        msk = build_mask(lat_h, lat_w, frame_num=81)
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
