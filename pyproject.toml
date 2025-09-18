@@ -64,4 +64,11 @@ profile = "black"
 [tool.mypy]
 strict = true
 
+[tool.ruff.format]
+quote-style = "preserve"
+
+
+[tool.ruff.lint]
+ignore = ["F401"]
+
 
