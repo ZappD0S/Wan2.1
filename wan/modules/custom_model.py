@@ -4,16 +4,31 @@ import math
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention
-from .model import WanLayerNorm, WanRMSNorm, rope_apply, rope_params, sinusoidal_embedding_1d
+from .model import (
+    WanLayerNorm,
+    WanRMSNorm,
+    rope_apply,
+    rope_params,
+    sinusoidal_embedding_1d,
+)
 
 __all__ = ["CustomWanModel"]
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
+
+
+# for ref_target_masks I think we need only the two faces (the background can be deduced)
+def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks):
+    # use eye() for the value. What should be the shape of the values be?
+
+    F.scaled_dot_product_attention
+    pass
 
 
 class CustomWanSelfAttention(nn.Module):
@@ -35,7 +50,7 @@ class CustomWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, ref_target_masks=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -54,17 +69,21 @@ class CustomWanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        q = rope_apply(q, grid_sizes, freqs)
+        k = rope_apply(k, grid_sizes, freqs)
         x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size,
+            q=q, k=k, v=v, k_lens=seq_lens, window_size=self.window_size
         )
 
         # output
         x = x.flatten(2)
         x = self.o(x)
+
+        with torch.no_grad():
+            # x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0],
+            #                                         ref_target_masks=ref_target_masks)
+            pass
+
         return x
 
 
@@ -135,16 +154,22 @@ class CustomWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CustomWanSelfAttention(dim, num_heads, window_size, qk_norm, eps)
+        self.self_attn = CustomWanSelfAttention(
+            dim, num_heads, window_size, qk_norm, eps
+        )
         self.norm3 = (
-            WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+            WanLayerNorm(dim, eps, elementwise_affine=True)
+            if cross_attn_norm
+            else nn.Identity()
         )
         self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](
             dim, num_heads, (-1, -1), qk_norm, eps
         )
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
-            nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim)
+            nn.Linear(dim, ffn_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(ffn_dim, dim),
         )
 
         # modulation
@@ -174,7 +199,9 @@ class CustomWanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs)
+        y = self.self_attn(
+            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs
+        )
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
@@ -231,7 +258,9 @@ class MLPProj(torch.nn.Module):
             torch.nn.LayerNorm(out_dim),
         )
         if flf_pos_emb:  # NOTE: we only use this for `flf2v`
-            self.emb_pos = nn.Parameter(torch.zeros(1, FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER, 1280))
+            self.emb_pos = nn.Parameter(
+                torch.zeros(1, FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER, 1280)
+            )
 
     def forward(self, image_embeds):
         if hasattr(self, "emb_pos"):
@@ -247,7 +276,13 @@ class CustomWanModel(ModelMixin, ConfigMixin):
     Wan diffusion backbone supporting both text-to-video and image-to-video.
     """
 
-    ignore_for_config = ["patch_size", "cross_attn_norm", "qk_norm", "text_dim", "window_size"]
+    ignore_for_config = [
+        "patch_size",
+        "cross_attn_norm",
+        "qk_norm",
+        "text_dim",
+        "window_size",
+    ]
     _no_split_modules = ["WanAttentionBlock"]
 
     @register_to_config
@@ -326,7 +361,9 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         self.eps = eps
 
         # embeddings
-        self.patch_embedding = nn.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size)
+        self.patch_embedding = nn.Conv3d(
+            in_dim, dim, kernel_size=patch_size, stride=patch_size
+        )
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim)
         )
@@ -417,12 +454,17 @@ class CustomWanModel(ModelMixin, ConfigMixin):
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        grid_sizes = torch.stack(
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]
+        )
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         assert seq_lens.max() <= seq_len
         x = torch.cat(
-            [torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x]
+            [
+                torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
+                for u in x
+            ]
         )
 
         # time embeddings
@@ -435,7 +477,10 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         context_lens = None
         context = self.text_embedding(
             torch.stack(
-                [torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]
+                [
+                    torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    for u in context
+                ]
             )
         )
 

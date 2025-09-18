@@ -8,6 +8,7 @@ from .vae import WanVAE
 __all__ = [
     'WanVAE',
     'WanModel',
+    'CustomWanModelVaceWanModel',
     'VaceWanModel',
     'T5Model',
     'T5Encoder',
