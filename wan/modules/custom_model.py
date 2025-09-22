@@ -2,11 +2,11 @@
 import math
 
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
+from einops import rearrange, repeat
 
 from .attention import flash_attention
 from .model import (
@@ -24,11 +24,41 @@ FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
 
 
 # for ref_target_masks I think we need only the two faces (the background can be deduced)
-def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks):
-    # use eye() for the value. What should be the shape of the values be?
+def get_attn_map_with_target(query, key, ref_target_masks, chunk_size=512):
+    batch_size, seq_len_q, num_heads, _ = query.shape
+    seq_len_k = key.shape[1]
 
-    F.scaled_dot_product_attention
-    pass
+    query = rearrange(query, "N L H E -> N H L E")
+    key = rearrange(key, "N L H E -> N H L E")
+
+    attention_weights = torch.zeros(
+        batch_size,
+        num_heads,
+        seq_len_q,
+        seq_len_k,
+        device=query.device,
+        dtype=query.dtype,
+    )
+
+    identity_value = torch.eye(seq_len_k, device=query.device, dtype=query.dtype)
+    identity_value = repeat(
+        identity_value, "L E -> N H L E", N=batch_size, H=num_heads
+    )
+
+    for i in range(0, seq_len_q, chunk_size):
+        start_idx = i
+        end_idx = min(i + chunk_size, seq_len_q)
+        query_chunk = query[:, :, start_idx:end_idx, :]
+
+        attention_weights_chunk = F.scaled_dot_product_attention(
+            query_chunk, key, identity_value
+        )
+        attention_weights[:, :, start_idx:end_idx, :] = attention_weights_chunk
+
+    # TODO: multiply by target_mask
+    # we only want to take into account the effect of the tokens of the face in the first frame
+
+    return attention_weights
 
 
 class CustomWanSelfAttention(nn.Module):
@@ -80,9 +110,21 @@ class CustomWanSelfAttention(nn.Module):
         x = self.o(x)
 
         with torch.no_grad():
-            # x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0],
-            #                                         ref_target_masks=ref_target_masks)
-            pass
+            q = q.type_as(x)
+            k = k.type_as(x)
+
+            F, H, W = grid_sizes[0]
+            k = rearrange(
+                k, "1 (F H W) num_heads c -> 1 F (H W) num_heads c", F=F, H=H, W=W
+            )
+
+            # take only the first frame latents
+            k = k[:, 0]
+
+            x_ref_attn_map = get_attn_map_with_target(q, k, ref_target_masks)
+            del x_ref_attn_map
+            import gc; gc.collect()
+            torch.cuda.empty_cache()
 
         return x
 
@@ -132,6 +174,8 @@ WAN_CROSSATTENTION_CLASSES = {
 
 
 class CustomWanAttentionBlock(nn.Module):
+    _keep_in_fp32_modules = ["norm1", "norm2", "norm3", "modulation"]
+
     def __init__(
         self,
         cross_attn_type,
@@ -194,7 +238,7 @@ class CustomWanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
@@ -202,14 +246,14 @@ class CustomWanAttentionBlock(nn.Module):
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs
         )
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast("cuda", dtype=torch.float32):
             x = x + y * e[2]
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-            with amp.autocast(dtype=torch.float32):
+            with torch.amp.autocast("cuda", dtype=torch.float32):
                 x = x + y * e[5]
             return x
 
@@ -218,6 +262,8 @@ class CustomWanAttentionBlock(nn.Module):
 
 
 class Head(nn.Module):
+    _keep_in_fp32_modules = ["norm", "head", "modulation"]
+
     def __init__(self, dim, out_dim, patch_size, eps=1e-6):
         super().__init__()
         self.dim = dim
@@ -240,7 +286,7 @@ class Head(nn.Module):
             e(Tensor): Shape [B, C]
         """
         assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = self.head(self.norm(x) * (1 + e[1]) + e[0])
         return x
@@ -272,6 +318,8 @@ class MLPProj(torch.nn.Module):
 
 
 class CustomWanModel(ModelMixin, ConfigMixin):
+    _keep_in_fp32_modules = ["time_embedding", "time_projection"]
+
     r"""
     Wan diffusion backbone supporting both text-to-video and image-to-video.
     """
@@ -468,7 +516,7 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         )
 
         # time embeddings
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast("cuda", dtype=torch.float32):
             e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
