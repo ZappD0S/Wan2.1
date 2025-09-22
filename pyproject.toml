@@ -64,6 +64,9 @@ profile = "black"
 [tool.mypy]
 strict = true
 
+[tool.ruff]
+line-length = 88
+
 [tool.ruff.format]
 quote-style = "preserve"
 
