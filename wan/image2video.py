@@ -11,7 +11,6 @@ from functools import partial
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from einops import rearrange
@@ -19,6 +18,7 @@ from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
 from .modules.clip import CLIPModel
+from .modules.custom_model import CustomWanModel
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
@@ -100,7 +100,11 @@ class WanI2V:
         )
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        # self.model = WanModel.from_pretrained(checkpoint_dir)
+        self.model = CustomWanModel.from_pretrained(
+            checkpoint_dir, torch_dtype=config.param_dtype
+        )
+
         self.model.eval().requires_grad_(False)
 
         if t5_fsdp or dit_fsdp or use_usp:
@@ -277,7 +281,11 @@ class WanI2V:
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
 
         # evaluation mode
-        with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+        with (
+            torch.amp.autocast("cuda", dtype=self.param_dtype),
+            torch.no_grad(),
+            no_sync(),
+        ):
             if sample_solver == 'unipc':
                 sample_scheduler = FlowUniPCMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
