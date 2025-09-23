@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
-from einops import rearrange, repeat
+from einops import rearrange, reduce, repeat
 
 from .attention import flash_attention
 from .model import (
@@ -24,14 +24,18 @@ FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
 
 
 # for ref_target_masks I think we need only the two faces (the background can be deduced)
-def get_attn_map_with_target(query, key, ref_target_masks, chunk_size=512):
+def compute_score_masks(query, key, ref_target_masks, chunk_size=512):
+    def _weighted_average(x, weights, dim):
+        weights = weights / weights.sum(dim=dim, keepdim=True)
+        return (x * weights).sum(dim=dim)
+
     batch_size, seq_len_q, num_heads, _ = query.shape
     seq_len_k = key.shape[1]
 
     query = rearrange(query, "N L H E -> N H L E")
     key = rearrange(key, "N L H E -> N H L E")
 
-    attention_weights = torch.zeros(
+    attn_weights = torch.zeros(
         batch_size,
         num_heads,
         seq_len_q,
@@ -41,9 +45,7 @@ def get_attn_map_with_target(query, key, ref_target_masks, chunk_size=512):
     )
 
     identity_value = torch.eye(seq_len_k, device=query.device, dtype=query.dtype)
-    identity_value = repeat(
-        identity_value, "L E -> N H L E", N=batch_size, H=num_heads
-    )
+    identity_value = repeat(identity_value, "L E -> N H L E", N=batch_size, H=num_heads)
 
     for i in range(0, seq_len_q, chunk_size):
         start_idx = i
@@ -53,12 +55,23 @@ def get_attn_map_with_target(query, key, ref_target_masks, chunk_size=512):
         attention_weights_chunk = F.scaled_dot_product_attention(
             query_chunk, key, identity_value
         )
-        attention_weights[:, :, start_idx:end_idx, :] = attention_weights_chunk
+        attn_weights[:, :, start_idx:end_idx, :] = attention_weights_chunk
 
-    # TODO: multiply by target_mask
+    attn_weights = reduce(attn_weights, 'N H L E -> N L E', 'mean')
+
+    background_mask = 1 - ref_target_masks.any(dim=0, keepdim=True).float()
+    ref_target_masks = torch.cat([ref_target_masks, background_mask])
+
     # we only want to take into account the effect of the tokens of the face in the first frame
+    simil_scores = []
+    for target_mask in ref_target_masks:
+        target_mask = target_mask[None, None, :]
+        simil_scores.append(_weighted_average(attn_weights, weights=target_mask, dim=2))
 
-    return attention_weights
+    simil_scores = torch.stack(simil_scores, dim=1)
+    score_masks = simil_scores == simil_scores.max(dim=1, keepdim=True).values
+
+    return score_masks
 
 
 class CustomWanSelfAttention(nn.Module):
@@ -121,10 +134,8 @@ class CustomWanSelfAttention(nn.Module):
             # take only the first frame latents
             k = k[:, 0]
 
-            x_ref_attn_map = get_attn_map_with_target(q, k, ref_target_masks)
-            del x_ref_attn_map
-            import gc; gc.collect()
-            torch.cuda.empty_cache()
+            # these masks say, for every frame, where the faces of each person is supposed to be
+            score_masks = compute_score_masks(q, k, ref_target_masks)
 
         return x
 
@@ -228,6 +239,7 @@ class CustomWanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        face_masks,
     ):
         r"""
         Args:
@@ -244,7 +256,11 @@ class CustomWanAttentionBlock(nn.Module):
 
         # self-attention
         y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs
+            self.norm1(x).float() * (1 + e[1]) + e[0],
+            seq_lens,
+            grid_sizes,
+            freqs,
+            face_masks,
         )
         with torch.amp.autocast("cuda", dtype=torch.float32):
             x = x + y * e[2]
@@ -468,6 +484,7 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
+        face_masks=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -515,6 +532,13 @@ class CustomWanModel(ModelMixin, ConfigMixin):
             ]
         )
 
+        _, N_h, N_w = grid_sizes[0]
+        face_masks = F.interpolate(
+            face_masks.unsqueeze(1), size=(N_h, N_w), mode='nearest'
+        ).squeeze(1)
+        face_masks = rearrange(face_masks, "N H W -> N (H W)")
+        face_masks = face_masks.to(device)
+
         # time embeddings
         with torch.amp.autocast("cuda", dtype=torch.float32):
             e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
@@ -544,6 +568,7 @@ class CustomWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
+            face_masks=face_masks,
         )
 
         for block in self.blocks:
