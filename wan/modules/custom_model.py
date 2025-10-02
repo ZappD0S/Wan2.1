@@ -100,7 +100,7 @@ class CustomWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, bias_kwargs=None):
+    def forward(self, x, seq_lens, grid_sizes, freqs, bias_kwargs):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -140,10 +140,6 @@ class CustomWanSelfAttention(nn.Module):
         # output
         x = x.flatten(2)
 
-        if bias_kwargs is None:
-            x = self.o(x)
-            return x, None
-
         face_masks = bias_kwargs["face_masks"]
         wlw = bias_kwargs["wlw"]
 
@@ -155,6 +151,10 @@ class CustomWanSelfAttention(nn.Module):
 
         # these masks say, for every frame, where the faces of each person is supposed to be
         simil_masks = compute_simil_masks(q, k_first_frame, face_masks)
+
+        if not bias_kwargs["bias"]:
+            x = self.o(x)
+            return x, simil_masks
 
         # TODO: for now we assume only two people for simplicity
         h1_face_mask, h2_face_mask = rearrange(
@@ -195,7 +195,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         # self.alpha = nn.Parameter(torch.zeros((1, )))
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, context, grid_sizes, bias_kwargs=None):
+    def forward(self, x, context, grid_sizes, bias_kwargs):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -206,21 +206,23 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             a_face_mask, b_face_mask = simil_masks.unbind(dim=1)
 
             a_len, link_len, b_len = map(lambda x: x.shape[1], tokens_list)
-            seq_len_k = a_len + link_len + b_len
 
-            a_tokens_mask = a_face_mask.new_zeros(seq_len_k)
-            a_tokens_mask[:a_len] = True
+            a_tokens_mask = simil_masks.new_ones(a_len)
             a_tokens_mask = rearrange(a_tokens_mask, "S -> 1 1 S")
             a_face_mask = rearrange(a_face_mask, "N L -> N L 1")
             a_attn_mask = a_tokens_mask & a_face_mask
 
-            b_tokens_mask = b_face_mask.new_zeros(seq_len_k)
-            b_tokens_mask[-b_len:] = True
+            b_tokens_mask = simil_masks.new_ones(b_len)
             b_tokens_mask = rearrange(b_tokens_mask, "S -> 1 1 S")
             b_face_mask = rearrange(b_face_mask, "N L -> N L 1")
             b_attn_mask = b_tokens_mask & b_face_mask
 
-            attn_mask = a_attn_mask | b_attn_mask
+            link_tokens_mask = simil_masks.new_ones(link_len)
+            link_tokens_mask = rearrange(link_tokens_mask, "S -> 1 1 S")
+            link_attn_mask = link_tokens_mask & torch.ones_like(a_face_mask)
+
+            attn_mask = torch.cat([a_attn_mask, link_attn_mask, b_attn_mask], dim=-1)
+
             time_mask = repeat(time_mask, "T -> 1 (T H W) 1", H=H, W=W)
             attn_mask = attn_mask & time_mask
 
@@ -266,7 +268,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         # TODO: is this the best way to use wlw? maybe we don't use it here and only use it
         # to add the new latents in a 'surgical' way?
 
-        if bias_kwargs is None:
+        if not bias_kwargs["bias"]:
             x = self.o(x)
             return x
 
@@ -349,7 +351,7 @@ class CustomWanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(self, x, e, seq_lens, grid_sizes, freqs, context, bias_kwargs=None):
+    def forward(self, x, e, seq_lens, grid_sizes, freqs, context, bias_kwargs):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
@@ -365,11 +367,8 @@ class CustomWanAttentionBlock(nn.Module):
 
         # self-attention
 
-        if bias_kwargs is None:
-            self_attn_bias_kwargs = None
-        else:
-            keys = ("face_masks", "wlw")
-            self_attn_bias_kwargs = {k: bias_kwargs[k] for k in keys}
+        keys = ("bias", "face_masks", "wlw")
+        self_attn_bias_kwargs = {k: bias_kwargs[k] for k in keys}
 
         y, simil_masks = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0],
@@ -384,13 +383,9 @@ class CustomWanAttentionBlock(nn.Module):
 
         # cross-attention & ffn
 
-        if bias_kwargs is None:
-            cross_attn_bias_kwargs = None
-        else:
-            assert simil_masks is not None
-            keys = ("descr_tokens_list", "link_tokens", "wlw")
-            cross_attn_bias_kwargs = {k: bias_kwargs[k] for k in keys}
-            cross_attn_bias_kwargs["simil_masks"] = simil_masks
+        keys = ("bias", "descr_tokens_list", "link_tokens", "wlw")
+        cross_attn_bias_kwargs = {k: bias_kwargs[k] for k in keys}
+        cross_attn_bias_kwargs["simil_masks"] = simil_masks
 
         x = x + self.cross_attn(
             self.norm3(x), context, grid_sizes, bias_kwargs=cross_attn_bias_kwargs
@@ -651,38 +646,37 @@ class CustomWanModel(ModelMixin, ConfigMixin):
 
         N_t, N_h, N_w = grid_sizes[0]
 
-        if bias_kwargs is not None:
-            bias_kwargs = bias_kwargs.copy()
-            face_masks = bias_kwargs["face_masks"]
-            face_masks = (
-                F.interpolate(
-                    face_masks.float().unsqueeze(1), size=(N_h, N_w), mode='nearest'
-                )
-                .squeeze(1)
-                .bool()
+        bias_kwargs = bias_kwargs.copy()
+        face_masks = bias_kwargs["face_masks"]
+        face_masks = (
+            F.interpolate(
+                face_masks.float().unsqueeze(1), size=(N_h, N_w), mode='nearest'
             )
-            face_masks = rearrange(face_masks, "N H W -> N (H W)")
-            bias_kwargs["face_masks"] = face_masks.to(device)
+            .squeeze(1)
+            .bool()
+        )
+        face_masks = rearrange(face_masks, "N H W -> N (H W)")
+        bias_kwargs["face_masks"] = face_masks.to(device)
 
-            wlw = bias_kwargs["wlw"]
-            wlw = (
-                F.interpolate(wlw.float().unsqueeze(1), size=(N_t,), mode='nearest')
-                .squeeze(1)
-                .bool()
-            )
-            bias_kwargs["wlw"] = wlw.to(device)
+        wlw = bias_kwargs["wlw"]
+        wlw = (
+            F.interpolate(wlw.float().unsqueeze(1), size=(N_t,), mode='nearest')
+            .squeeze(1)
+            .bool()
+        )
+        bias_kwargs["wlw"] = wlw.to(device)
 
-            descr_tokens_list = bias_kwargs["descr_tokens_list"]
-            link_tokens = bias_kwargs["link_tokens"]
+        descr_tokens_list = bias_kwargs["descr_tokens_list"]
+        link_tokens = bias_kwargs["link_tokens"]
 
-            descr_tokens_list = [
-                self.text_embedding(descr_tokens.unsqueeze(0))
-                for descr_tokens in descr_tokens_list
-            ]
-            link_tokens = self.text_embedding(torch.stack(link_tokens))
+        descr_tokens_list = [
+            self.text_embedding(descr_tokens.unsqueeze(0))
+            for descr_tokens in descr_tokens_list
+        ]
+        link_tokens = self.text_embedding(torch.stack(link_tokens))
 
-            bias_kwargs["descr_tokens_list"] = descr_tokens_list
-            bias_kwargs["link_tokens"] = link_tokens
+        bias_kwargs["descr_tokens_list"] = descr_tokens_list
+        bias_kwargs["link_tokens"] = link_tokens
 
         # time embeddings
         with torch.amp.autocast("cuda", dtype=torch.float32):
@@ -713,34 +707,20 @@ class CustomWanModel(ModelMixin, ConfigMixin):
             context=context,
         )
 
-        if bias_kwargs is not None:
-            blocks_bias_schedule = bias_kwargs.pop("blocks_bias_schedule")
-        else:
-            blocks_bias_schedule = None
+        bias = bias_kwargs.pop("bias")
+        blocks_bias_schedule = bias_kwargs.pop("blocks_bias_schedule")
 
         simil_masks_list = []
 
         for i, block in enumerate(self.blocks):
-            bias = (
-                blocks_bias_schedule[i] if blocks_bias_schedule is not None else False
-            )
+            bias_block = blocks_bias_schedule[i]
 
-            kwargs = shared_kwargs.copy()
+            shared_kwargs["bias_kwargs"] = bias_kwargs | {"bias": bias and bias_block}
+            x, simil_masks = block(x, **shared_kwargs)
 
-            if bias:
-                assert bias_kwargs is not None
-                kwargs["bias_kwargs"] = bias_kwargs
+            simil_masks_list.append(simil_masks)
 
-            x, simil_masks = block(x, **kwargs)
-
-            if bias:
-                assert simil_masks is not None
-                simil_masks_list.append(simil_masks)
-
-        if simil_masks_list:
-            simil_masks = torch.stack(simil_masks_list)
-        else:
-            simil_masks = None
+        simil_masks = torch.stack(simil_masks_list)
 
         # head
         x = self.head(x, e)

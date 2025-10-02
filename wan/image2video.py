@@ -273,7 +273,7 @@ class WanI2V:
         max_seq_len,
         guide_scale,
         offload_model,
-        bias_kwargs=None,
+        bias_kwargs,
     ):
         shared_kwargs = {
             "t": timestep,
@@ -290,14 +290,13 @@ class WanI2V:
 
         if offload_model:
             noise_pred_cond = noise_pred_cond.to('cpu')
-            if bias_kwargs is not None:
-                assert simil_masks is not None
-                simil_masks.to('cpu')
+            simil_masks.to('cpu')
 
             torch.cuda.empty_cache()
 
         uncond_kwargs = shared_kwargs.copy()
         uncond_kwargs["context"] = context_null
+        uncond_kwargs["bias_kwargs"] = bias_kwargs | {"bias": False}
 
         [noise_pred_uncond], _ = self.model(latent, **uncond_kwargs)
 
@@ -416,7 +415,7 @@ class WanI2V:
 
             self.model.to(self.device)
             for i, t in enumerate(tqdm(timesteps)):
-                bias = timestep_bias_schedule[i]
+                bias_timestep = timestep_bias_schedule[i]
 
                 timestep = torch.tensor([t], device=self.device)
                 latent = latent.to(self.device)
@@ -428,15 +427,13 @@ class WanI2V:
                     context=context,
                     context_null=context_null,
                     clip_context=clip_context,
-                    bias_kwargs=bias_kwargs if bias else None,
+                    bias_kwargs=bias_kwargs | {"bias": bias_timestep},
                     max_seq_len=max_seq_len,
                     guide_scale=guide_scale,
                     offload_model=offload_model,
                 )
 
-                if bias:
-                    assert simil_masks is not None
-                    simil_masks_list.append(simil_masks)
+                simil_masks_list.append(simil_masks)
 
                 latent = latent.to(
                     torch.device('cpu') if offload_model else self.device
