@@ -111,7 +111,9 @@ class WanI2V:
             init_on_cpu = False
 
         if use_usp:
-            from xfuser.core.distributed import get_sequence_parallel_world_size
+            from xfuser.core.distributed import (  # type: ignore
+                get_sequence_parallel_world_size,
+            )
 
             from .distributed.xdit_context_parallel import (
                 usp_attn_forward,
@@ -155,7 +157,7 @@ class WanI2V:
 
         face_masks = face_masks.float().unsqueeze(1)
         face_masks = F.interpolate(face_masks, size=(lat_h, lat_w), mode='nearest')
-        face_masks = face_masks.squeeze(1)
+        face_masks = face_masks.squeeze(1).bool()
 
         h = lat_h * self.vae_stride[1]
         w = lat_w * self.vae_stride[2]
@@ -200,29 +202,39 @@ class WanI2V:
 
         return noise, y, face_masks, max_seq_len
 
-    def _build_context(self, img, input_prompt, n_prompt, offload_model):
+    def _build_context(
+        self, img, input_prompt, n_prompt, descr_list, link_text, offload_model
+    ):
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
-        # preprocess
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
+        if self.t5_cpu:
+            device = torch.device('cpu')
         else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+            self.text_encoder.model.to(self.device)
+            device = self.device
+
+        context = self.text_encoder([input_prompt], device)
+        context_null = self.text_encoder([n_prompt], device)
+        descr_tokens_list = self.text_encoder(descr_list, device)
+        link_tokens = self.text_encoder([link_text], device)
+
+        if self.t5_cpu:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
+            descr_tokens_list = [t.to(self.device) for t in descr_tokens_list]
+            link_tokens = [t.to(self.device) for t in link_tokens]
+        elif offload_model:
+            self.text_encoder.model.cpu()
+            torch.cuda.empty_cache()
 
         self.clip.model.to(self.device)
         clip_context = self.clip.visual([img[:, None, :, :]])
         if offload_model:
             self.clip.model.cpu()
+            torch.cuda.empty_cache()
 
-        return context, context_null, clip_context
+        return context, context_null, clip_context, descr_tokens_list, link_tokens
 
     def _get_scheduler(self, sample_solver, sampling_steps, shift):
         if sample_solver == 'unipc':
@@ -258,34 +270,36 @@ class WanI2V:
         context,
         context_null,
         clip_context,
-        face_masks,
         max_seq_len,
         guide_scale,
         offload_model,
+        bias_kwargs=None,
     ):
-        noise_pred_cond = self.model(
-            latent,
-            t=timestep,
-            context=context,
-            clip_fea=clip_context,
-            face_masks=face_masks,
-            seq_len=max_seq_len,
-            y=y,
-        )[0]
+        shared_kwargs = {
+            "t": timestep,
+            "clip_fea": clip_context,
+            "seq_len": max_seq_len,
+            "y": y,
+        }
+
+        cond_kwargs = shared_kwargs.copy()
+        cond_kwargs["context"] = context
+        cond_kwargs["bias_kwargs"] = bias_kwargs
+
+        [noise_pred_cond], simil_masks = self.model(latent, **cond_kwargs)
 
         if offload_model:
             noise_pred_cond = noise_pred_cond.to('cpu')
+            if bias_kwargs is not None:
+                assert simil_masks is not None
+                simil_masks.to('cpu')
+
             torch.cuda.empty_cache()
 
-        noise_pred_uncond = self.model(
-            latent,
-            t=timestep,
-            context=context_null,
-            clip_fea=clip_context,
-            face_masks=face_masks,
-            seq_len=max_seq_len,
-            y=y,
-        )[0]
+        uncond_kwargs = shared_kwargs.copy()
+        uncond_kwargs["context"] = context_null
+
+        [noise_pred_uncond], _ = self.model(latent, **uncond_kwargs)
 
         if offload_model:
             noise_pred_uncond = noise_pred_uncond.to('cpu')
@@ -295,13 +309,13 @@ class WanI2V:
             noise_pred_cond - noise_pred_uncond
         )
 
-        return noise_pred
+        return noise_pred, simil_masks
 
     def generate(
         self,
         input_prompt,
         img,
-        face_masks,
+        bias_kwargs,
         max_area=720 * 1280,
         frame_num=81,
         shift=5.0,
@@ -354,12 +368,25 @@ class WanI2V:
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
-        noise, y, face_masks, max_seq_len = self._build_latents(
-            img, face_masks, frame_num, max_area, seed_g
+        bias_kwargs = bias_kwargs.copy()
+
+        noise, y, bias_kwargs["face_masks"], max_seq_len = self._build_latents(
+            img, bias_kwargs["face_masks"], frame_num, max_area, seed_g
         )
 
-        context, context_null, clip_context = self._build_context(
-            img, input_prompt, n_prompt, offload_model=offload_model
+        (
+            context,
+            context_null,
+            clip_context,
+            bias_kwargs["descr_tokens_list"],
+            bias_kwargs["link_tokens"],
+        ) = self._build_context(
+            img,
+            input_prompt,
+            n_prompt,
+            descr_list=bias_kwargs.pop("descr_list"),
+            link_text=bias_kwargs.pop("link_text"),
+            offload_model=offload_model,
         )
 
         @contextmanager
@@ -383,23 +410,33 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
+            timestep_bias_schedule = bias_kwargs.pop("timestep_bias_schedule")
+
+            simil_masks_list = []
+
             self.model.to(self.device)
-            for _, t in enumerate(tqdm(timesteps)):
+            for i, t in enumerate(tqdm(timesteps)):
+                bias = timestep_bias_schedule[i]
+
                 timestep = torch.tensor([t], device=self.device)
                 latent = latent.to(self.device)
 
-                noise_pred = self._compute_noise_pred(
+                noise_pred, simil_masks = self._compute_noise_pred(
                     [latent],
                     timestep,
                     [y],
                     context=context,
                     context_null=context_null,
                     clip_context=clip_context,
-                    face_masks=face_masks,
+                    bias_kwargs=bias_kwargs if bias else None,
                     max_seq_len=max_seq_len,
                     guide_scale=guide_scale,
                     offload_model=offload_model,
                 )
+
+                if bias:
+                    assert simil_masks is not None
+                    simil_masks_list.append(simil_masks)
 
                 latent = latent.to(
                     torch.device('cpu') if offload_model else self.device
@@ -431,4 +468,4 @@ class WanI2V:
         if dist.is_initialized():
             dist.barrier()
 
-        return videos[0] if self.rank == 0 else None
+        return (videos[0], simil_masks_list) if self.rank == 0 else None
