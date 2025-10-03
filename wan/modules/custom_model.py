@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
-from einops import rearrange, reduce, repeat
+from einops import einsum, rearrange, reduce, repeat
 
 from .attention import flash_attention
 from .model import (
@@ -24,17 +24,13 @@ T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
 
 
-# for ref_target_masks I think we need only the two faces (the background can be deduced)
 def compute_simil_masks(query, key, face_masks, chunk_size=512):
     def _weighted_average(x, weights, dim):
         weights = weights / weights.sum(dim=dim, keepdim=True)
         return (x * weights).sum(dim=dim)
 
-    batch_size, seq_len_q, num_heads, _ = query.shape
+    batch_size, seq_len_q, num_heads, head_dim = query.shape
     seq_len_k = key.shape[1]
-
-    query = rearrange(query, "N L H E -> N H L E")
-    key = rearrange(key, "N S H E -> N H S E")
 
     sum_attn_weights = torch.zeros(
         batch_size,
@@ -44,21 +40,17 @@ def compute_simil_masks(query, key, face_masks, chunk_size=512):
         dtype=query.dtype,
     )
 
-    identity_value = torch.eye(seq_len_k, device=query.device, dtype=query.dtype)
-    identity_value = repeat(identity_value, "S E -> N H S E", N=batch_size, H=num_heads)
+    scale_factor = 1 / math.sqrt(head_dim)
 
     for i in range(0, seq_len_q, chunk_size):
         start_idx = i
         end_idx = min(i + chunk_size, seq_len_q)
-        query_chunk = query[:, :, start_idx:end_idx, :]
+        query_chunk = query[:, start_idx:end_idx, :, :]
 
-        attention_weights_chunk = F.scaled_dot_product_attention(
-            query=query_chunk, key=key, value=identity_value
-        )
-        summed_weights_chunk = reduce(
-            attention_weights_chunk, "N H L S -> N L S", "sum"
-        )
+        attn_scores_chunk = einsum(query_chunk, key, "N L H E, N S H E -> N L H S")
+        attn_weights_chunk = F.softmax(attn_scores_chunk * scale_factor, dim=-1)
 
+        summed_weights_chunk = reduce(attn_weights_chunk, "N L H S -> N L S", "sum")
         sum_attn_weights[:, start_idx:end_idx, :] += summed_weights_chunk
 
     attn_weights = sum_attn_weights / num_heads
@@ -70,7 +62,9 @@ def compute_simil_masks(query, key, face_masks, chunk_size=512):
     simil_scores = []
     for target_mask in face_masks:
         target_mask = rearrange(target_mask, "S -> 1 1 S")
-        simil_scores.append(_weighted_average(attn_weights, weights=target_mask, dim=2))
+        simil_scores.append(
+            _weighted_average(attn_weights, weights=target_mask.float(), dim=2)
+        )
 
     simil_scores = torch.stack(simil_scores, dim=1)
     simil_masks = simil_scores == simil_scores.max(dim=1, keepdim=True).values
@@ -203,6 +197,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         """
 
         def _calc_cross_attn(q, tokens_list, simil_masks, time_mask):
+            N, _, L = simil_masks.shape
             a_face_mask, b_face_mask = simil_masks.unbind(dim=1)
 
             a_len, link_len, b_len = map(lambda x: x.shape[1], tokens_list)
@@ -217,9 +212,10 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             b_face_mask = rearrange(b_face_mask, "N L -> N L 1")
             b_attn_mask = b_tokens_mask & b_face_mask
 
-            link_tokens_mask = simil_masks.new_ones(link_len)
-            link_tokens_mask = rearrange(link_tokens_mask, "S -> 1 1 S")
-            link_attn_mask = link_tokens_mask & torch.ones_like(a_face_mask)
+            # link_tokens_mask = simil_masks.new_ones(link_len)
+            # link_tokens_mask = rearrange(link_tokens_mask, "S -> 1 1 S")
+            # link_attn_mask = link_tokens_mask & torch.ones_like(a_face_mask)
+            link_attn_mask = simil_masks.new_ones(N, L, link_len)
 
             attn_mask = torch.cat([a_attn_mask, link_attn_mask, b_attn_mask], dim=-1)
 
@@ -275,26 +271,43 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         _, H, W = grid_sizes[0]
 
         h1_descr_tokens, h2_descr_tokens = bias_kwargs["descr_tokens_list"]
+        pos_link_tokens, neg_link_tokens = bias_kwargs["link_tokens_list"]
         h1_looks_h2, h2_looks_h1 = bias_kwargs["wlw"]
 
         simil_masks = bias_kwargs["simil_masks"]
-        link_tokens = bias_kwargs["link_tokens"]
 
         y1 = _calc_cross_attn(
-            q, [h1_descr_tokens, link_tokens, h2_descr_tokens], simil_masks, h1_looks_h2
+            q,
+            [h1_descr_tokens, pos_link_tokens, h2_descr_tokens],
+            simil_masks,
+            h1_looks_h2,
         )
 
         y2 = _calc_cross_attn(
-            q, [h2_descr_tokens, link_tokens, h1_descr_tokens], simil_masks, h2_looks_h1
+            q,
+            [h2_descr_tokens, pos_link_tokens, h1_descr_tokens],
+            simil_masks,
+            h2_looks_h1,
         )
 
-        # TODO: maybe add a negative link token ("is not looking at") and invert wlw masks
-        # and compute two more cross-attentions?
+        y3 = _calc_cross_attn(
+            q,
+            [h1_descr_tokens, neg_link_tokens, h2_descr_tokens],
+            simil_masks,
+            ~h1_looks_h2,
+        )
+
+        y4 = _calc_cross_attn(
+            q,
+            [h2_descr_tokens, neg_link_tokens, h1_descr_tokens],
+            simil_masks,
+            ~h2_looks_h1,
+        )
 
         # TODO: make eps a parameter
         # TODO: how do we pick this parameter?
         eps = 0.1
-        x = x + 0.5 * eps * (y1 + y2)
+        x = x + eps * (y1 + y2 + y3 + y4) / 4
 
         x = self.o(x)
         return x
@@ -383,7 +396,7 @@ class CustomWanAttentionBlock(nn.Module):
 
         # cross-attention & ffn
 
-        keys = ("bias", "descr_tokens_list", "link_tokens", "wlw")
+        keys = ("bias", "descr_tokens_list", "link_tokens_list", "wlw")
         cross_attn_bias_kwargs = {k: bias_kwargs[k] for k in keys}
         cross_attn_bias_kwargs["simil_masks"] = simil_masks
 
@@ -667,16 +680,19 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         bias_kwargs["wlw"] = wlw.to(device)
 
         descr_tokens_list = bias_kwargs["descr_tokens_list"]
-        link_tokens = bias_kwargs["link_tokens"]
+        link_tokens_list = bias_kwargs["link_tokens_list"]
 
         descr_tokens_list = [
             self.text_embedding(descr_tokens.unsqueeze(0))
             for descr_tokens in descr_tokens_list
         ]
-        link_tokens = self.text_embedding(torch.stack(link_tokens))
+        link_tokens_list = [
+            self.text_embedding(link_tokens.unsqueeze(0))
+            for link_tokens in link_tokens_list
+        ]
 
         bias_kwargs["descr_tokens_list"] = descr_tokens_list
-        bias_kwargs["link_tokens"] = link_tokens
+        bias_kwargs["link_tokens_list"] = link_tokens_list
 
         # time embeddings
         with torch.amp.autocast("cuda", dtype=torch.float32):

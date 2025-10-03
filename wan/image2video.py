@@ -203,7 +203,7 @@ class WanI2V:
         return noise, y, face_masks, max_seq_len
 
     def _build_context(
-        self, img, input_prompt, n_prompt, descr_list, link_text, offload_model
+        self, img, input_prompt, n_prompt, descr_list, link_list, offload_model
     ):
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
@@ -217,13 +217,13 @@ class WanI2V:
         context = self.text_encoder([input_prompt], device)
         context_null = self.text_encoder([n_prompt], device)
         descr_tokens_list = self.text_encoder(descr_list, device)
-        link_tokens = self.text_encoder([link_text], device)
+        link_tokens_list = self.text_encoder(link_list, device)
 
         if self.t5_cpu:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
             descr_tokens_list = [t.to(self.device) for t in descr_tokens_list]
-            link_tokens = [t.to(self.device) for t in link_tokens]
+            link_tokens_list = [t.to(self.device) for t in link_tokens_list]
         elif offload_model:
             self.text_encoder.model.cpu()
             torch.cuda.empty_cache()
@@ -234,7 +234,7 @@ class WanI2V:
             self.clip.model.cpu()
             torch.cuda.empty_cache()
 
-        return context, context_null, clip_context, descr_tokens_list, link_tokens
+        return context, context_null, clip_context, descr_tokens_list, link_tokens_list
 
     def _get_scheduler(self, sample_solver, sampling_steps, shift):
         if sample_solver == 'unipc':
@@ -378,13 +378,13 @@ class WanI2V:
             context_null,
             clip_context,
             bias_kwargs["descr_tokens_list"],
-            bias_kwargs["link_tokens"],
+            bias_kwargs["link_tokens_list"],
         ) = self._build_context(
             img,
             input_prompt,
             n_prompt,
             descr_list=bias_kwargs.pop("descr_list"),
-            link_text=bias_kwargs.pop("link_text"),
+            link_list=bias_kwargs.pop("link_list"),
             offload_model=offload_model,
         )
 
