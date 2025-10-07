@@ -7,8 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
-from einops import einsum, rearrange, reduce, repeat
+from einops import rearrange, repeat
 
+from ..utils.simil_mask import compute_simil_masks
+from ..utils.smooth_mask import generate_soft_mask
 from .attention import flash_attention
 from .model import (
     WanLayerNorm,
@@ -22,57 +24,6 @@ __all__ = ["CustomWanModel"]
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
-
-
-def compute_simil_masks(query, key, face_masks, chunk_size=512):
-    def _weighted_average(x, weights, dim):
-        weights = weights / weights.sum(dim=dim, keepdim=True)
-        return (x * weights).sum(dim=dim)
-
-    batch_size, seq_len_q, num_heads, head_dim = query.shape
-    seq_len_k = key.shape[1]
-
-    sum_attn_weights = torch.zeros(
-        batch_size,
-        seq_len_q,
-        seq_len_k,
-        device=query.device,
-        dtype=query.dtype,
-    )
-
-    scale_factor = 1 / math.sqrt(head_dim)
-
-    for i in range(0, seq_len_q, chunk_size):
-        start_idx = i
-        end_idx = min(i + chunk_size, seq_len_q)
-        query_chunk = query[:, start_idx:end_idx, :, :]
-
-        attn_scores_chunk = einsum(query_chunk, key, "N L H E, N S H E -> N L H S")
-        attn_weights_chunk = F.softmax(attn_scores_chunk * scale_factor, dim=-1)
-
-        summed_weights_chunk = reduce(attn_weights_chunk, "N L H S -> N L S", "sum")
-        sum_attn_weights[:, start_idx:end_idx, :] += summed_weights_chunk
-
-    attn_weights = sum_attn_weights / num_heads
-
-    background_mask = ~(face_masks.any(dim=0, keepdim=True))
-    face_masks = torch.cat([face_masks, background_mask])
-
-    # we only want to take into account the effect of the tokens of the face in the first frame
-    simil_scores = []
-    for target_mask in face_masks:
-        target_mask = rearrange(target_mask, "S -> 1 1 S")
-        simil_scores.append(
-            _weighted_average(attn_weights, weights=target_mask.float(), dim=2)
-        )
-
-    simil_scores = torch.stack(simil_scores, dim=1)
-    simil_masks = simil_scores == simil_scores.max(dim=1, keepdim=True).values
-
-    # we don't care about the background
-    simil_masks = simil_masks[:, :-1]
-
-    return simil_masks
 
 
 class CustomWanSelfAttention(nn.Module):
@@ -170,10 +121,10 @@ class CustomWanSelfAttention(nn.Module):
         y = F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask)
         y = rearrange(y, "N H L E -> N L (H E)")
 
-        # TODO: make eps a parameter
+        # TODO: make beta a parameter
         # TODO: how do we pick this parameter?
-        eps = 0.1
-        x = x + eps * y
+        beta = 0.1
+        x = x + beta * y
 
         x = self.o(x)
 
@@ -197,7 +148,6 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         """
 
         def _calc_cross_attn(q, tokens_list, simil_masks, time_mask):
-            N, _, L = simil_masks.shape
             a_face_mask, b_face_mask = simil_masks.unbind(dim=1)
 
             a_len, link_len, b_len = map(lambda x: x.shape[1], tokens_list)
@@ -212,15 +162,13 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             b_face_mask = rearrange(b_face_mask, "N L -> N L 1")
             b_attn_mask = b_tokens_mask & b_face_mask
 
-            # link_tokens_mask = simil_masks.new_ones(link_len)
-            # link_tokens_mask = rearrange(link_tokens_mask, "S -> 1 1 S")
-            # link_attn_mask = link_tokens_mask & torch.ones_like(a_face_mask)
+            N, _, L = simil_masks.shape
             link_attn_mask = simil_masks.new_ones(N, L, link_len)
 
             attn_mask = torch.cat([a_attn_mask, link_attn_mask, b_attn_mask], dim=-1)
 
-            time_mask = repeat(time_mask, "T -> 1 (T H W) 1", H=H, W=W)
-            attn_mask = attn_mask & time_mask
+            # time_mask = repeat(time_mask, "T -> 1 (T H W) 1", H=H, W=W)
+            # attn_mask = attn_mask & time_mask
 
             descr_tokens = torch.cat(tokens_list, dim=1)
             k = self.norm_k(self.k(descr_tokens))
@@ -236,6 +184,13 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             )
             # merge heads and channel dims
             y = rearrange(y, "N H L E -> N L (H E)")
+
+            _, H, W = grid_sizes[0]
+
+            time_mask_smooth = generate_soft_mask(time_mask, transition_duration=3)
+            time_mask_smooth = repeat(time_mask_smooth, "T -> 1 (T H W) 1", H=H, W=W)
+            # y = y * time_mask_smooth
+            y = self.o(y) * time_mask_smooth
 
             return y
 
@@ -268,48 +223,75 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             x = self.o(x)
             return x
 
-        _, H, W = grid_sizes[0]
-
-        h1_descr_tokens, h2_descr_tokens = bias_kwargs["descr_tokens_list"]
+        descr_tokens_list = bias_kwargs["descr_tokens_list"]
         pos_link_tokens, neg_link_tokens = bias_kwargs["link_tokens_list"]
-        h1_looks_h2, h2_looks_h1 = bias_kwargs["wlw"]
-
+        a_looks_b, b_looks_a = bias_kwargs["wlw"]
         simil_masks = bias_kwargs["simil_masks"]
 
-        y1 = _calc_cross_attn(
-            q,
-            [h1_descr_tokens, pos_link_tokens, h2_descr_tokens],
-            simil_masks,
-            h1_looks_h2,
-        )
+        ys = []
+        for neg in (False, True):
+            for reverse in (False, True):
+                if reverse:
+                    b_descr_tokens, a_descr_tokens = descr_tokens_list
+                    time_mask = b_looks_a
+                else:
+                    a_descr_tokens, b_descr_tokens = descr_tokens_list
+                    time_mask = a_looks_b
 
-        y2 = _calc_cross_attn(
-            q,
-            [h2_descr_tokens, pos_link_tokens, h1_descr_tokens],
-            simil_masks,
-            h2_looks_h1,
-        )
+                if neg:
+                    link_tokens = neg_link_tokens
+                    time_mask = ~time_mask
+                else:
+                    link_tokens = pos_link_tokens
 
-        y3 = _calc_cross_attn(
-            q,
-            [h1_descr_tokens, neg_link_tokens, h2_descr_tokens],
-            simil_masks,
-            ~h1_looks_h2,
-        )
+                y = _calc_cross_attn(
+                    q,
+                    [a_descr_tokens, link_tokens, b_descr_tokens],
+                    simil_masks,
+                    time_mask,
+                )
 
-        y4 = _calc_cross_attn(
-            q,
-            [h2_descr_tokens, neg_link_tokens, h1_descr_tokens],
-            simil_masks,
-            ~h2_looks_h1,
-        )
+                ys.append(y)
 
-        # TODO: make eps a parameter
+        # y1 = _calc_cross_attn(
+        #     q,
+        #     [h1_descr_tokens, pos_link_tokens, h2_descr_tokens],
+        #     simil_masks,
+        #     h1_looks_h2,
+        # )
+
+        # y2 = _calc_cross_attn(
+        #     q,
+        #     [h2_descr_tokens, pos_link_tokens, h1_descr_tokens],
+        #     simil_masks,
+        #     h2_looks_h1,
+        # )
+
+        # y3 = _calc_cross_attn(
+        #     q,
+        #     [h1_descr_tokens, neg_link_tokens, h2_descr_tokens],
+        #     simil_masks,
+        #     ~h1_looks_h2,
+        # )
+
+        # y4 = _calc_cross_attn(
+        #     q,
+        #     [h2_descr_tokens, neg_link_tokens, h1_descr_tokens],
+        #     simil_masks,
+        #     ~h2_looks_h1,
+        # )
+
         # TODO: how do we pick this parameter?
-        eps = 0.1
-        x = x + eps * (y1 + y2 + y3 + y4) / 4
+        # TODO: is combining AFTER applying self.o better?
 
-        x = self.o(x)
+        beta = bias_kwargs["beta"]
+        # x = x + beta * (y1 + y2 + y3 + y4)
+        # y = sum(self.o(y) for y in [y1, y2, y3, y4])
+        # x = self.o(x) + beta * y
+        x = self.o(x) + beta * torch.stack(ys).sum(dim=0)
+
+        # x = self.o(x)
+        # return (1 - beta) * x + beta * y
         return x
 
 
@@ -396,7 +378,7 @@ class CustomWanAttentionBlock(nn.Module):
 
         # cross-attention & ffn
 
-        keys = ("bias", "descr_tokens_list", "link_tokens_list", "wlw")
+        keys = ("bias", "beta", "descr_tokens_list", "link_tokens_list", "wlw")
         cross_attn_bias_kwargs = {k: bias_kwargs[k] for k in keys}
         cross_attn_bias_kwargs["simil_masks"] = simil_masks
 
@@ -657,26 +639,19 @@ class CustomWanModel(ModelMixin, ConfigMixin):
             ]
         )
 
-        N_t, N_h, N_w = grid_sizes[0]
-
         bias_kwargs = bias_kwargs.copy()
+        T, H, W = grid_sizes[0]
+
         face_masks = bias_kwargs["face_masks"]
-        face_masks = (
-            F.interpolate(
-                face_masks.float().unsqueeze(1), size=(N_h, N_w), mode='nearest'
-            )
-            .squeeze(1)
-            .bool()
-        )
-        face_masks = rearrange(face_masks, "N H W -> N (H W)")
+        face_masks = rearrange(face_masks.float(), "N H W -> N 1 H W")
+        face_masks = F.interpolate(face_masks, size=(H, W), mode='nearest')
+        face_masks = rearrange(face_masks.bool(), "N 1 H W -> N (H W)")
         bias_kwargs["face_masks"] = face_masks.to(device)
 
         wlw = bias_kwargs["wlw"]
-        wlw = (
-            F.interpolate(wlw.float().unsqueeze(1), size=(N_t,), mode='nearest')
-            .squeeze(1)
-            .bool()
-        )
+        wlw = rearrange(wlw.float(), "N T -> N 1 T")
+        wlw = F.interpolate(wlw, size=(T,), mode='nearest')
+        wlw = rearrange(wlw.bool(), "N 1 T -> N T")
         bias_kwargs["wlw"] = wlw.to(device)
 
         descr_tokens_list = bias_kwargs["descr_tokens_list"]
@@ -736,7 +711,8 @@ class CustomWanModel(ModelMixin, ConfigMixin):
 
             simil_masks_list.append(simil_masks)
 
-        simil_masks = torch.stack(simil_masks_list)
+        simil_masks = torch.stack(simil_masks_list, dim=1)
+        simil_masks = rearrange(simil_masks, "... (T H W) -> ... T H W", T=T, H=H, W=W)
 
         # head
         x = self.head(x, e)
@@ -762,12 +738,25 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         """
 
         c = self.out_dim
+        p, q, r = self.patch_size
         out = []
+
         for u, v in zip(x, grid_sizes.tolist()):
-            u = u[: math.prod(v)].view(*v, *self.patch_size, c)
-            u = torch.einsum("fhwpqrc->cfphqwr", u)
-            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
+            u = u[: math.prod(v)]
+            f, h, w = v
+            u = rearrange(
+                u,
+                "(f h w) (p q r c) -> c (f p) (h q) (w r)",
+                f=f,
+                h=h,
+                w=w,
+                p=p,
+                q=q,
+                r=r,
+                c=c,
+            )
             out.append(u)
+
         return out
 
     def init_weights(self):

@@ -170,9 +170,10 @@ class WanI2V:
         )
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
+        r = 4
         noise = torch.randn(
             16,
-            (frame_num - 1) // 4 + 1,
+            (frame_num + r - 1) // r,
             lat_h,
             lat_w,
             dtype=torch.float32,
@@ -180,24 +181,19 @@ class WanI2V:
             device=self.device,
         )
 
-        msk = torch.zeros(4 + (frame_num - 1), lat_h, lat_w, device=self.device)
-        msk[:4] = 1
-        # the transposition is intentional here
-        msk = rearrange(msk, "(g r) h w -> r g h w", r=4)
+        padding_frames = torch.zeros(3, frame_num - 1, h, w)
+        resized_img = torch.nn.functional.interpolate(
+            img.unsqueeze(0).cpu(), size=(h, w), mode="bicubic"
+        )
+        resized_img = rearrange(resized_img, "1 C H W -> C 1 H W")
 
-        y = self.vae.encode(
-            [
-                torch.concat(
-                    [
-                        torch.nn.functional.interpolate(
-                            img[None].cpu(), size=(h, w), mode='bicubic'
-                        ).transpose(0, 1),
-                        torch.zeros(3, frame_num - 1, h, w),
-                    ],
-                    dim=1,
-                ).to(self.device)
-            ]
-        )[0]
+        input_sequence = torch.concat([resized_img, padding_frames], dim=1)
+        input_sequence = input_sequence.to(self.device)
+
+        y = self.vae.encode([input_sequence])[0]
+        msk = y.new_zeros(r, (frame_num + r - 1) // r, lat_h, lat_w)
+        # set the first frame (in latent space) to one
+        msk[:, 0] = 1
         y = torch.concat([msk, y])
 
         return noise, y, face_masks, max_seq_len
@@ -433,11 +429,12 @@ class WanI2V:
                     offload_model=offload_model,
                 )
 
-                simil_masks_list.append(simil_masks)
-
                 latent = latent.to(
                     torch.device('cpu') if offload_model else self.device
                 )
+
+                simil_masks = simil_masks.to('cpu')
+                simil_masks_list.append(simil_masks)
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
@@ -465,4 +462,6 @@ class WanI2V:
         if dist.is_initialized():
             dist.barrier()
 
-        return (videos[0], simil_masks_list) if self.rank == 0 else None
+        simil_masks = torch.stack(simil_masks_list, dim=1)
+
+        return (videos[0], simil_masks) if self.rank == 0 else None
