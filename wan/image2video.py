@@ -11,7 +11,6 @@ from functools import partial
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
@@ -30,7 +29,6 @@ from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
 class WanI2V:
-
     def __init__(
         self,
         config,
@@ -89,32 +87,35 @@ class WanI2V:
         self.patch_size = config.patch_size
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+            device=self.device,
+        )
 
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
             device=self.device,
-            checkpoint_path=os.path.join(checkpoint_dir,
-                                         config.clip_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
+            checkpoint_path=os.path.join(checkpoint_dir, config.clip_checkpoint),
+            tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer),
+        )
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        self.model = WanModel.from_pretrained(checkpoint_dir, torch_dtype=config.param_dtype)
         self.model.eval().requires_grad_(False)
 
         if t5_fsdp or dit_fsdp or use_usp:
             init_on_cpu = False
 
         if use_usp:
-            from xfuser.core.distributed import get_sequence_parallel_world_size
+            from xfuser.core.distributed import get_sequence_parallel_world_size # type: ignore
 
             from .distributed.xdit_context_parallel import (
                 usp_attn_forward,
                 usp_dit_forward,
             )
+
             for block in self.model.blocks:
                 block.self_attn.forward = types.MethodType(
-                    usp_attn_forward, block.self_attn)
+                    usp_attn_forward, block.self_attn
+                )
             self.model.forward = types.MethodType(usp_dit_forward, self.model)
             self.sp_size = get_sequence_parallel_world_size()
         else:
@@ -130,18 +131,20 @@ class WanI2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
-    def generate(self,
-                 input_prompt,
-                 img,
-                 max_area=720 * 1280,
-                 frame_num=81,
-                 shift=5.0,
-                 sample_solver='unipc',
-                 sampling_steps=40,
-                 guide_scale=5.0,
-                 n_prompt="",
-                 seed=-1,
-                 offload_model=True):
+    def generate(
+        self,
+        input_prompt,
+        img,
+        max_area=720 * 1280,
+        frame_num=81,
+        shift=5.0,
+        sample_solver='unipc',
+        sampling_steps=40,
+        guide_scale=5.0,
+        n_prompt="",
+        seed=-1,
+        offload_model=True,
+    ):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -184,35 +187,46 @@ class WanI2V:
         h, w = img.shape[1:]
         aspect_ratio = h / w
         lat_h = round(
-            np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
-            self.patch_size[1] * self.patch_size[1])
+            np.sqrt(max_area * aspect_ratio)
+            // self.vae_stride[1]
+            // self.patch_size[1]
+            * self.patch_size[1]
+        )
         lat_w = round(
-            np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] //
-            self.patch_size[2] * self.patch_size[2])
+            np.sqrt(max_area / aspect_ratio)
+            // self.vae_stride[2]
+            // self.patch_size[2]
+            * self.patch_size[2]
+        )
         h = lat_h * self.vae_stride[1]
         w = lat_w * self.vae_stride[2]
 
-        max_seq_len = ((F - 1) // self.vae_stride[0] + 1) * lat_h * lat_w // (
-            self.patch_size[1] * self.patch_size[2])
+        max_seq_len = (
+            ((F - 1) // self.vae_stride[0] + 1)
+            * lat_h
+            * lat_w
+            // (self.patch_size[1] * self.patch_size[2])
+        )
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
         noise = torch.randn(
-            16, (F - 1) // 4 + 1,
+            16,
+            (F - 1) // 4 + 1,
             lat_h,
             lat_w,
             dtype=torch.float32,
             generator=seed_g,
-            device=self.device)
+            device=self.device,
+        )
 
         msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
-        msk = torch.concat([
-            torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-        ],
-                           dim=1)
+        msk = torch.concat(
+            [torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1
+        )
         msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
         msk = msk.transpose(1, 2)[0]
 
@@ -237,15 +251,19 @@ class WanI2V:
         if offload_model:
             self.clip.model.cpu()
 
-        y = self.vae.encode([
-            torch.concat([
-                torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, F - 1, h, w)
-            ],
-                         dim=1).to(self.device)
-        ])[0]
+        y = self.vae.encode(
+            [
+                torch.concat(
+                    [
+                        torch.nn.functional.interpolate(
+                            img[None].cpu(), size=(h, w), mode='bicubic'
+                        ).transpose(0, 1),
+                        torch.zeros(3, F - 1, h, w),
+                    ],
+                    dim=1,
+                ).to(self.device)
+            ]
+        )[0]
         y = torch.concat([msk, y])
 
         @contextmanager
@@ -255,26 +273,27 @@ class WanI2V:
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
 
         # evaluation mode
-        with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
-
+        with torch.amp.autocast("cuda", dtype=self.param_dtype), torch.no_grad(), no_sync():
             if sample_solver == 'unipc':
                 sample_scheduler = FlowUniPCMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
                     shift=1,
-                    use_dynamic_shifting=False)
+                    use_dynamic_shifting=False,
+                )
                 sample_scheduler.set_timesteps(
-                    sampling_steps, device=self.device, shift=shift)
+                    sampling_steps, device=self.device, shift=shift
+                )
                 timesteps = sample_scheduler.timesteps
             elif sample_solver == 'dpm++':
                 sample_scheduler = FlowDPMSolverMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
                     shift=1,
-                    use_dynamic_shifting=False)
+                    use_dynamic_shifting=False,
+                )
                 sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
                 timesteps, _ = retrieve_timesteps(
-                    sample_scheduler,
-                    device=self.device,
-                    sigmas=sampling_sigmas)
+                    sample_scheduler, device=self.device, sigmas=sampling_sigmas
+                )
             else:
                 raise NotImplementedError("Unsupported solver.")
 
@@ -305,28 +324,31 @@ class WanI2V:
 
                 timestep = torch.stack(timestep).to(self.device)
 
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0].to(
-                        torch.device('cpu') if offload_model else self.device)
+                noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c)[
+                    0
+                ].to(torch.device('cpu') if offload_model else self.device)
                 if offload_model:
                     torch.cuda.empty_cache()
                 noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0].to(
-                        torch.device('cpu') if offload_model else self.device)
+                    latent_model_input, t=timestep, **arg_null
+                )[0].to(torch.device('cpu') if offload_model else self.device)
                 if offload_model:
                     torch.cuda.empty_cache()
                 noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                    noise_pred_cond - noise_pred_uncond
+                )
 
                 latent = latent.to(
-                    torch.device('cpu') if offload_model else self.device)
+                    torch.device('cpu') if offload_model else self.device
+                )
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
                     t,
                     latent.unsqueeze(0),
                     return_dict=False,
-                    generator=seed_g)[0]
+                    generator=seed_g,
+                )[0]
                 latent = temp_x0.squeeze(0)
 
                 x0 = [latent.to(self.device)]
