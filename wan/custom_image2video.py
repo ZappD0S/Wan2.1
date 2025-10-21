@@ -8,6 +8,7 @@ import sys
 import types
 from contextlib import contextmanager
 from functools import partial
+from itertools import permutations
 
 import numpy as np
 import torch
@@ -28,6 +29,21 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+
+
+def find_subsequence(seq, subseq):
+    seq_len = len(seq)
+    subseq_len = len(subseq)
+
+    if subseq_len > seq_len:
+        return -1
+
+    for i in range(seq_len - subseq_len + 1):
+        window = seq[i : i + subseq_len]
+        if window == subseq:
+            return i
+
+    return -1
 
 
 class CustomWanI2V:
@@ -100,7 +116,6 @@ class CustomWanI2V:
         )
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        # self.model = WanModel.from_pretrained(checkpoint_dir)
         self.model = CustomWanModel.from_pretrained(
             checkpoint_dir, torch_dtype=config.param_dtype
         )
@@ -198,28 +213,77 @@ class CustomWanI2V:
 
         return noise, y, face_masks, max_seq_len
 
-    def _build_context(
-        self, img, input_prompt, n_prompt, descr_list, link_list, offload_model
-    ):
+    def _build_context(self, img, input_prompt, n_prompt, bias_kwargs, offload_model):
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
         if self.t5_cpu:
-            device = torch.device('cpu')
+            t5_device = torch.device('cpu')
         else:
             self.text_encoder.model.to(self.device)
-            device = self.device
+            t5_device = self.device
 
-        context = self.text_encoder([input_prompt], device)
-        context_null = self.text_encoder([n_prompt], device)
-        descr_tokens_list = self.text_encoder(descr_list, device)
-        link_tokens_list = self.text_encoder(link_list, device)
+        context = self.text_encoder([input_prompt], t5_device)
+        context_null = self.text_encoder([n_prompt], t5_device)
+
+        bias_kwargs = bias_kwargs.copy()
+
+        tokens_data_list = []
+        tokenizer = self.text_encoder.tokenizer
+
+        pos_link_text, neg_link_text = bias_kwargs.pop("link_list")
+        descr_list = bias_kwargs.pop("descr_list")
+
+        n_characters = len(descr_list)
+
+        for link_text, neg in [(pos_link_text, False), (neg_link_text, True)]:
+            for i, j in permutations(range(n_characters), r=2):
+                a_descr, b_descr = descr_list[i], descr_list[j]
+
+                text = " ".join([a_descr, link_text, b_descr]) + "."
+                text_tokens = self.text_encoder([text], t5_device)
+
+                if self.t5_cpu:
+                    text_tokens = [t.to(self.device) for t in text_tokens]
+
+                descr_masks_list = []
+                [main_token_ids], [main_text_mask] = tokenizer(
+                    text, return_mask=True, return_tensors=None
+                )
+                main_text_mask = torch.tensor(
+                    main_text_mask, dtype=bool, device=self.device
+                )
+
+                for descr in [a_descr, b_descr]:
+                    [descr_token_ids] = tokenizer(
+                        descr,
+                        padding=False,
+                        add_special_tokens=False,
+                        return_tensors=None,
+                    )
+
+                    descr_mask = torch.zeros_like(main_text_mask)
+                    start_index = find_subsequence(main_token_ids, descr_token_ids)
+                    descr_mask[start_index : start_index + len(descr_token_ids)] = True
+                    assert not (descr_mask & (~main_text_mask)).any()
+
+                    descr_masks_list.append(descr_mask)
+
+                a_tokens_mask, b_tokens_mask = descr_masks_list
+
+                tokens_data_list.append(
+                    {
+                        "inds": (i, j),
+                        "neg": neg,
+                        "text_tokens": text_tokens,
+                        "text_token_mask": main_text_mask,
+                        "descr_token_masks": (a_tokens_mask, b_tokens_mask),
+                    }
+                )
 
         if self.t5_cpu:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
-            descr_tokens_list = [t.to(self.device) for t in descr_tokens_list]
-            link_tokens_list = [t.to(self.device) for t in link_tokens_list]
         elif offload_model:
             self.text_encoder.model.cpu()
             torch.cuda.empty_cache()
@@ -230,7 +294,9 @@ class CustomWanI2V:
             self.clip.model.cpu()
             torch.cuda.empty_cache()
 
-        return context, context_null, clip_context, descr_tokens_list, link_tokens_list
+        bias_kwargs["tokens_data_list"] = tokens_data_list
+
+        return context, context_null, clip_context, bias_kwargs
 
     def _get_scheduler(self, sample_solver, sampling_steps, shift):
         if sample_solver == 'unipc':
@@ -369,18 +435,11 @@ class CustomWanI2V:
             img, bias_kwargs["face_masks"], frame_num, max_area, seed_g
         )
 
-        (
-            context,
-            context_null,
-            clip_context,
-            bias_kwargs["descr_tokens_list"],
-            bias_kwargs["link_tokens_list"],
-        ) = self._build_context(
+        context, context_null, clip_context, bias_kwargs = self._build_context(
             img,
             input_prompt,
             n_prompt,
-            descr_list=bias_kwargs.pop("descr_list"),
-            link_list=bias_kwargs.pop("link_list"),
+            bias_kwargs=bias_kwargs,
             offload_model=offload_model,
         )
 

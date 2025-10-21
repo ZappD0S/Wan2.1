@@ -7,19 +7,13 @@ from einops import einsum, rearrange, reduce
 
 def compute_simil_masks(query, key, face_masks, chunk_size=512):
     def _weighted_average(x, weights, dim):
-        weights = weights / weights.sum(dim=dim, keepdim=True)
+        weights = weights / weights.sum(dim=dim, keepdim=True).clamp(min=1e-6)
         return (x * weights).sum(dim=dim)
 
     batch_size, seq_len_q, num_heads, head_dim = query.shape
     seq_len_k = key.shape[1]
 
-    sum_attn_weights = torch.zeros(
-        batch_size,
-        seq_len_q,
-        seq_len_k,
-        device=query.device,
-        dtype=query.dtype,
-    )
+    sum_attn_weights = query.new_zeros(batch_size, seq_len_q, seq_len_k)
 
     scale_factor = 1 / math.sqrt(head_dim)
 

@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import gc
 import math
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -62,18 +63,6 @@ class CustomWanSelfAttention(nn.Module):
             v = self.v(x).view(b, s, n, d)
             return q, k, v
 
-        def _calc_attn_mask(looks_mask, observer_face_mask, observed_face_mask):
-            looks_mask = rearrange(looks_mask, "T -> T 1")
-
-            observer_dim_mask = rearrange(
-                observer_face_mask & looks_mask, "T (H W) -> (T H W) 1", H=H, W=W
-            )
-            observed_dim_mask = rearrange(
-                observed_face_mask & looks_mask, "T (H W) -> 1 (T H W)", H=H, W=W
-            )
-
-            return observer_dim_mask & observed_dim_mask
-
         q, k, v = qkv_fn(x)
 
         q = rope_apply(q, grid_sizes, freqs)
@@ -86,10 +75,8 @@ class CustomWanSelfAttention(nn.Module):
         x = x.flatten(2)
 
         face_masks = bias_kwargs["face_masks"]
-        wlw = bias_kwargs["wlw"]
 
         T, H, W = grid_sizes[0]
-
         k_first_frame = rearrange(
             k, "1 (T H W) num_heads E -> 1 T (H W) num_heads E", T=T, H=H, W=W
         )[:, 0]
@@ -97,37 +84,7 @@ class CustomWanSelfAttention(nn.Module):
         # these masks say, for every frame, where the faces of each person is supposed to be
         simil_masks = compute_simil_masks(q, k_first_frame, face_masks)
 
-        if not bias_kwargs["bias"]:
-            x = self.o(x)
-            return x, simil_masks
-
-        # TODO: for now we assume only two people for simplicity
-        h1_face_mask, h2_face_mask = rearrange(
-            simil_masks, "1 N (T H W) -> N T (H W)", T=T, H=H, W=W
-        )
-        h1_looks_h2, h2_looks_h1 = wlw
-
-        h1_attn_mask = _calc_attn_mask(h1_looks_h2, h1_face_mask, h2_face_mask)
-        h2_attn_mask = _calc_attn_mask(h2_looks_h1, h2_face_mask, h1_face_mask)
-        attn_mask = h1_attn_mask | h2_attn_mask
-
-        del h1_attn_mask, h2_attn_mask
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        q = rearrange(q, "N L H E -> N H L E")
-        k = rearrange(k, "N S H E -> N H S E")
-        v = rearrange(v, "N S H E -> N H S E")
-        y = F.scaled_dot_product_attention(query=q, key=k, value=v, attn_mask=attn_mask)
-        y = rearrange(y, "N H L E -> N L (H E)")
-
-        # TODO: make beta a parameter
-        # TODO: how do we pick this parameter?
-        beta = 0.1
-        x = x + beta * y
-
         x = self.o(x)
-
         return x, simil_masks
 
 
@@ -147,32 +104,36 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             context(Tensor): Shape [B, L2, C]
         """
 
-        def _calc_cross_attn(q, tokens_list, simil_masks, time_mask):
-            a_face_mask, b_face_mask = simil_masks.unbind(dim=1)
+        def _calc_cross_attn(
+            q,
+            text_tokens,
+            text_token_mask,
+            descr_token_masks,
+            simil_masks_list,
+            time_mask,
+        ):
+            a_face_mask, b_face_mask = simil_masks_list
+            a_tokens_mask, b_tokens_mask = descr_token_masks
 
-            a_len, link_len, b_len = map(lambda x: x.shape[1], tokens_list)
+            N, L = a_face_mask.shape
+            attn_mask = repeat(text_token_mask, "S -> N L S", N=N, L=L)
 
-            a_tokens_mask = simil_masks.new_ones(a_len)
             a_tokens_mask = rearrange(a_tokens_mask, "S -> 1 1 S")
             a_face_mask = rearrange(a_face_mask, "N L -> N L 1")
-            a_attn_mask = a_tokens_mask & a_face_mask
+            # attn_mask = torch.where(a_tokens_mask, attn_mask & a_face_mask, attn_mask)
+            attn_mask &= ~a_tokens_mask | a_face_mask
 
-            b_tokens_mask = simil_masks.new_ones(b_len)
             b_tokens_mask = rearrange(b_tokens_mask, "S -> 1 1 S")
             b_face_mask = rearrange(b_face_mask, "N L -> N L 1")
-            b_attn_mask = b_tokens_mask & b_face_mask
+            # attn_mask = torch.where(b_tokens_mask, attn_mask & b_face_mask, attn_mask)
+            attn_mask &= ~b_tokens_mask | b_face_mask
 
-            N, _, L = simil_masks.shape
-            link_attn_mask = simil_masks.new_ones(N, L, link_len)
+            _, H, W = grid_sizes[0]
+            time_mask = repeat(time_mask, "T -> 1 (T H W) 1", H=H, W=W)
+            attn_mask &= time_mask
 
-            attn_mask = torch.cat([a_attn_mask, link_attn_mask, b_attn_mask], dim=-1)
-
-            # time_mask = repeat(time_mask, "T -> 1 (T H W) 1", H=H, W=W)
-            # attn_mask = attn_mask & time_mask
-
-            descr_tokens = torch.cat(tokens_list, dim=1)
-            k = self.norm_k(self.k(descr_tokens))
-            v = self.v(descr_tokens)
+            k = self.norm_k(self.k(text_tokens))
+            v = self.v(text_tokens)
 
             # the head before seq_len is necessary for scaled_dot_product_attention
             q = rearrange(q, "N L H E -> N H L E")
@@ -184,13 +145,6 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             )
             # merge heads and channel dims
             y = rearrange(y, "N H L E -> N L (H E)")
-
-            _, H, W = grid_sizes[0]
-
-            time_mask_smooth = generate_soft_mask(time_mask, transition_duration=3)
-            time_mask_smooth = repeat(time_mask_smooth, "T -> 1 (T H W) 1", H=H, W=W)
-            # y = y * time_mask_smooth
-            y = self.o(y) * time_mask_smooth
 
             return y
 
@@ -215,83 +169,51 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         img_x = img_x.flatten(2)
         x = x + img_x
 
-        # TODO: assemble all possible pairs of char_descr_tokens with link_tokens to form "sentences"
-        # TODO: is this the best way to use wlw? maybe we don't use it here and only use it
-        # to add the new latents in a 'surgical' way?
-
         if not bias_kwargs["bias"]:
             x = self.o(x)
             return x
 
-        descr_tokens_list = bias_kwargs["descr_tokens_list"]
-        pos_link_tokens, neg_link_tokens = bias_kwargs["link_tokens_list"]
-        a_looks_b, b_looks_a = bias_kwargs["wlw"]
         simil_masks = bias_kwargs["simil_masks"]
+        wlw_matrix = bias_kwargs["wlw_matrix"]
+        tokens_data_list = bias_kwargs["tokens_data_list"]
 
-        ys = []
-        for neg in (False, True):
-            for reverse in (False, True):
-                if reverse:
-                    b_descr_tokens, a_descr_tokens = descr_tokens_list
-                    time_mask = b_looks_a
-                else:
-                    a_descr_tokens, b_descr_tokens = descr_tokens_list
-                    time_mask = a_looks_b
+        y_list = []
 
-                if neg:
-                    link_tokens = neg_link_tokens
-                    time_mask = ~time_mask
-                else:
-                    link_tokens = pos_link_tokens
+        for tokens_data in tokens_data_list:
+            i, j = tokens_data["inds"]
+            neg = tokens_data["neg"]
 
-                y = _calc_cross_attn(
-                    q,
-                    [a_descr_tokens, link_tokens, b_descr_tokens],
-                    simil_masks,
-                    time_mask,
-                )
+            time_mask = wlw_matrix[i, j]
+            if neg:
+                time_mask = ~time_mask
 
-                ys.append(y)
+            a_face_mask = simil_masks[:, i]
+            b_face_mask = simil_masks[:, j]
 
-        # y1 = _calc_cross_attn(
-        #     q,
-        #     [h1_descr_tokens, pos_link_tokens, h2_descr_tokens],
-        #     simil_masks,
-        #     h1_looks_h2,
-        # )
+            text_tokens = tokens_data["text_tokens"]
+            text_token_mask = tokens_data["text_token_mask"]
+            descr_token_masks = tokens_data["descr_token_masks"]
 
-        # y2 = _calc_cross_attn(
-        #     q,
-        #     [h2_descr_tokens, pos_link_tokens, h1_descr_tokens],
-        #     simil_masks,
-        #     h2_looks_h1,
-        # )
-
-        # y3 = _calc_cross_attn(
-        #     q,
-        #     [h1_descr_tokens, neg_link_tokens, h2_descr_tokens],
-        #     simil_masks,
-        #     ~h1_looks_h2,
-        # )
-
-        # y4 = _calc_cross_attn(
-        #     q,
-        #     [h2_descr_tokens, neg_link_tokens, h1_descr_tokens],
-        #     simil_masks,
-        #     ~h2_looks_h1,
-        # )
-
-        # TODO: how do we pick this parameter?
-        # TODO: is combining AFTER applying self.o better?
+            y = _calc_cross_attn(
+                q,
+                text_tokens,
+                text_token_mask,
+                descr_token_masks,
+                [a_face_mask, b_face_mask],
+                time_mask,
+            )
+            y_list.append(y)
 
         beta = bias_kwargs["beta"]
-        # x = x + beta * (y1 + y2 + y3 + y4)
-        # y = sum(self.o(y) for y in [y1, y2, y3, y4])
-        # x = self.o(x) + beta * y
-        x = self.o(x) + beta * torch.stack(ys).sum(dim=0)
+        y = torch.stack(y_list).mean(dim=0)
+
+        x = self.o(x)
+        y = self.o(y)
+
+        x = (1 - beta) * x + beta * y
 
         # x = self.o(x)
-        # return (1 - beta) * x + beta * y
+
         return x
 
 
@@ -362,7 +284,7 @@ class CustomWanAttentionBlock(nn.Module):
 
         # self-attention
 
-        keys = ("bias", "face_masks", "wlw")
+        keys = ("bias", "face_masks")
         self_attn_bias_kwargs = {k: bias_kwargs[k] for k in keys}
 
         y, simil_masks = self.self_attn(
@@ -378,7 +300,7 @@ class CustomWanAttentionBlock(nn.Module):
 
         # cross-attention & ffn
 
-        keys = ("bias", "beta", "descr_tokens_list", "link_tokens_list", "wlw")
+        keys = ("bias", "beta", "tokens_data_list", "wlw_matrix")
         cross_attn_bias_kwargs = {k: bias_kwargs[k] for k in keys}
         cross_attn_bias_kwargs["simil_masks"] = simil_masks
 
@@ -639,7 +561,8 @@ class CustomWanModel(ModelMixin, ConfigMixin):
             ]
         )
 
-        bias_kwargs = bias_kwargs.copy()
+        # TODO: the deepcopy can be avoided
+        bias_kwargs = deepcopy(bias_kwargs)
         T, H, W = grid_sizes[0]
 
         face_masks = bias_kwargs["face_masks"]
@@ -648,26 +571,25 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         face_masks = rearrange(face_masks.bool(), "N 1 H W -> N (H W)")
         bias_kwargs["face_masks"] = face_masks.to(device)
 
-        wlw = bias_kwargs["wlw"]
-        wlw = rearrange(wlw.float(), "N T -> N 1 T")
-        wlw = F.interpolate(wlw, size=(T,), mode='nearest')
-        wlw = rearrange(wlw.bool(), "N 1 T -> N T")
-        bias_kwargs["wlw"] = wlw.to(device)
+        wlw_matrix = bias_kwargs["wlw_matrix"]
 
-        descr_tokens_list = bias_kwargs["descr_tokens_list"]
-        link_tokens_list = bias_kwargs["link_tokens_list"]
+        N1, N2, _ = wlw_matrix.shape
+        assert N1 == N2
+        wlw_matrix = rearrange(wlw_matrix.float(), "N1 N2 T -> (N1 N2) 1 T")
+        wlw_matrix = F.interpolate(wlw_matrix, size=(T,), mode='nearest')
+        wlw_matrix = rearrange(
+            wlw_matrix.bool(), "(N1 N2) 1 T -> N1 N2 T", N1=N1, N2=N2
+        )
+        bias_kwargs["wlw_matrix"] = wlw_matrix.to(device)
 
-        descr_tokens_list = [
-            self.text_embedding(descr_tokens.unsqueeze(0))
-            for descr_tokens in descr_tokens_list
-        ]
-        link_tokens_list = [
-            self.text_embedding(link_tokens.unsqueeze(0))
-            for link_tokens in link_tokens_list
-        ]
-
-        bias_kwargs["descr_tokens_list"] = descr_tokens_list
-        bias_kwargs["link_tokens_list"] = link_tokens_list
+        for tokens_data in bias_kwargs["tokens_data_list"]:
+            tokens_list = tokens_data["text_tokens"]
+            padded_tokens_list = [
+                F.pad(tokens, (0, 0, 0, self.text_len - tokens.size(-2)))
+                for tokens in tokens_list
+            ]
+            padded_tokens = torch.stack(padded_tokens_list)
+            tokens_data["text_tokens"] = self.text_embedding(padded_tokens)
 
         # time embeddings
         with torch.amp.autocast("cuda", dtype=torch.float32):
