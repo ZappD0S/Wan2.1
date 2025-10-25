@@ -29,6 +29,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.subsequence import get_nested_subsequence_mask
 
 
 def find_subsequence(seq, subseq):
@@ -213,7 +214,7 @@ class CustomWanI2V:
 
         return noise, y, face_masks, max_seq_len
 
-    def _build_context(self, img, input_prompt, n_prompt, bias_kwargs, offload_model):
+    def _build_context(self, img, base_prompt, n_prompt, bias_kwargs, offload_model):
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
@@ -223,7 +224,6 @@ class CustomWanI2V:
             self.text_encoder.model.to(self.device)
             t5_device = self.device
 
-        context = self.text_encoder([input_prompt], t5_device)
         context_null = self.text_encoder([n_prompt], t5_device)
 
         bias_kwargs = bias_kwargs.copy()
@@ -231,55 +231,135 @@ class CustomWanI2V:
         tokens_data_list = []
         tokenizer = self.text_encoder.tokenizer
 
-        pos_link_text, neg_link_text = bias_kwargs.pop("link_list")
+        link_text = bias_kwargs.pop("link_text")
         descr_list = bias_kwargs.pop("descr_list")
 
         n_characters = len(descr_list)
 
-        for link_text, neg in [(pos_link_text, False), (neg_link_text, True)]:
-            for i, j in permutations(range(n_characters), r=2):
-                a_descr, b_descr = descr_list[i], descr_list[j]
+        gaze_prompts = []
+        gaze_prompt_data = {}
+        for i, j in permutations(range(n_characters), r=2):
+            a_descr, b_descr = descr_list[i], descr_list[j]
+            a_descr = a_descr.capitalize()
+            gaze_prompt = " ".join([a_descr, link_text, b_descr]) + "."
+            gaze_prompts.append(gaze_prompt)
 
-                text = " ".join([a_descr, link_text, b_descr]) + "."
-                text_tokens = self.text_encoder([text], t5_device)
-
-                if self.t5_cpu:
-                    text_tokens = [t.to(self.device) for t in text_tokens]
-
-                descr_masks_list = []
-                [main_token_ids], [main_text_mask] = tokenizer(
-                    text, return_mask=True, return_tensors=None
+            [gaze_token_ids] = tokenizer(
+                gaze_prompt,
+                padding=False,
+                add_special_tokens=False,
+                return_tensors="np",
+            )
+            descr_token_ids_list = []
+            for descr in [a_descr, b_descr]:
+                [descr_token_ids] = tokenizer(
+                    descr,
+                    padding=False,
+                    add_special_tokens=False,
+                    return_tensors="np",
                 )
-                main_text_mask = torch.tensor(
-                    main_text_mask, dtype=bool, device=self.device
+                descr_token_ids_list.append(descr_token_ids)
+
+            gaze_prompt_data[(i, j)] = {
+                "gaze_token_ids": gaze_token_ids,
+                "descr_token_ids_list": descr_token_ids_list,
+            }
+
+        prompt = " ".join([base_prompt, *gaze_prompts])
+
+        context = self.text_encoder([prompt], t5_device)
+
+        [full_token_ids], [full_token_mask] = tokenizer(
+            prompt, return_mask=True, return_tensors="np"
+        )
+        full_token_mask = torch.from_numpy(full_token_mask).to(
+            dtype=bool, device=self.device
+        )
+        bias_kwargs["full_token_mask"] = full_token_mask
+
+        [base_token_ids] = tokenizer(
+            base_prompt,
+            padding=False,
+            add_special_tokens=False,
+            return_tensors="np",
+        )
+        base_token_mask = get_nested_subsequence_mask(full_token_ids, [base_token_ids])
+        bias_kwargs["base_token_mask"] = base_token_mask
+
+        for (i, j), ids_dict in gaze_prompt_data.items():
+            gaze_token_ids = ids_dict["gaze_token_ids"]
+            descr_token_ids_list = ids_dict["descr_token_ids_list"]
+
+            gaze_token_mask = get_nested_subsequence_mask(
+                full_token_ids, [gaze_token_ids]
+            )
+            gaze_token_mask = torch.from_numpy(gaze_token_mask).to(
+                dtype=bool, device=self.device
+            )
+
+            descr_masks_list = []
+            for descr_token_ids in descr_token_ids_list:
+                descr_mask = get_nested_subsequence_mask(
+                    full_token_ids, [gaze_token_ids, descr_token_ids]
                 )
-
-                for descr in [a_descr, b_descr]:
-                    [descr_token_ids] = tokenizer(
-                        descr,
-                        padding=False,
-                        add_special_tokens=False,
-                        return_tensors=None,
-                    )
-
-                    descr_mask = torch.zeros_like(main_text_mask)
-                    start_index = find_subsequence(main_token_ids, descr_token_ids)
-                    descr_mask[start_index : start_index + len(descr_token_ids)] = True
-                    assert not (descr_mask & (~main_text_mask)).any()
-
-                    descr_masks_list.append(descr_mask)
-
-                a_tokens_mask, b_tokens_mask = descr_masks_list
-
-                tokens_data_list.append(
-                    {
-                        "inds": (i, j),
-                        "neg": neg,
-                        "text_tokens": text_tokens,
-                        "text_token_mask": main_text_mask,
-                        "descr_token_masks": (a_tokens_mask, b_tokens_mask),
-                    }
+                descr_mask = torch.from_numpy(descr_mask).to(
+                    dtype=bool, device=self.device
                 )
+                assert not (descr_mask & (~gaze_token_mask)).any()
+                descr_masks_list.append(descr_mask)
+
+            tokens_data_list.append(
+                {
+                    "inds": (i, j),
+                    "gaze_token_mask": gaze_token_mask,
+                    "descr_token_masks": descr_masks_list,
+                }
+            )
+
+        # for link_text, neg in [(pos_link_text, False), (neg_link_text, True)]:
+        #     for i, j in permutations(range(n_characters), r=2):
+        #         a_descr, b_descr = descr_list[i], descr_list[j]
+        #
+        #         text = " ".join([a_descr, link_text, b_descr]) + "."
+        #         text_tokens = self.text_encoder([text], t5_device)
+        #
+        #         if self.t5_cpu:
+        #             text_tokens = [t.to(self.device) for t in text_tokens]
+        #
+        #         descr_masks_list = []
+        #         [main_token_ids], [main_text_mask] = tokenizer(
+        #             text, return_mask=True, return_tensors=None
+        #         )
+        #         main_text_mask = torch.tensor(
+        #             main_text_mask, dtype=bool, device=self.device
+        #         )
+        #
+        #         for descr in [a_descr, b_descr]:
+        #             [descr_token_ids] = tokenizer(
+        #                 descr,
+        #                 padding=False,
+        #                 add_special_tokens=False,
+        #                 return_tensors=None,
+        #             )
+        #
+        #             descr_mask = torch.zeros_like(main_text_mask)
+        #             start_index = find_subsequence(main_token_ids, descr_token_ids)
+        #             descr_mask[start_index : start_index + len(descr_token_ids)] = True
+        #             assert not (descr_mask & (~main_text_mask)).any()
+        #
+        #             descr_masks_list.append(descr_mask)
+        #
+        #         a_tokens_mask, b_tokens_mask = descr_masks_list
+        #
+        #         tokens_data_list.append(
+        #             {
+        #                 "inds": (i, j),
+        #                 "neg": neg,
+        #                 "text_tokens": text_tokens,
+        #                 "text_token_mask": main_text_mask,
+        #                 "descr_token_masks": (a_tokens_mask, b_tokens_mask),
+        #             }
+        #         )
 
         if self.t5_cpu:
             context = [t.to(self.device) for t in context]
