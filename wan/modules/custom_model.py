@@ -1,8 +1,8 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import gc
 import math
-from copy import deepcopy
 
+# from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,7 +10,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange, repeat
 
-from ..utils.simil_mask import compute_simil_masks
+from ..utils.simil_mask import compute_attn_mask, compute_simil_masks
 from ..utils.smooth_mask import generate_soft_mask
 from .attention import flash_attention
 from .model import (
@@ -116,6 +116,11 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             attn_mask = repeat(main_token_mask, "S -> N L S", N=N, L=L)
             _, H, W = grid_sizes[0]
 
+            k = self.norm_k(self.k(text_tokens))
+            v = self.v(text_tokens)
+            k = rearrange(k, "N S (H E) -> N S H E", H=self.num_heads, E=self.head_dim)
+            v = rearrange(v, "N S (H E) -> N S H E", H=self.num_heads, E=self.head_dim)
+
             for tokens_data in descr_token_data_list:
                 i, j = tokens_data["inds"]
                 a_tokens_mask, b_tokens_mask = tokens_data["descr_token_masks"]
@@ -142,13 +147,10 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
                     gaze_token_mask, attn_mask & time_mask, attn_mask
                 )
 
-            k = self.norm_k(self.k(text_tokens))
-            v = self.v(text_tokens)
-
             # the head before seq_len is necessary for scaled_dot_product_attention
             q = rearrange(q, "N L H E -> N H L E")
-            k = rearrange(k, "N S (H E) -> N H S E", H=self.num_heads, E=self.head_dim)
-            v = rearrange(v, "N S (H E) -> N H S E", H=self.num_heads, E=self.head_dim)
+            k = rearrange(k, "N S H E -> N H S E")
+            v = rearrange(v, "N S H E -> N H S E")
 
             y = F.scaled_dot_product_attention(
                 query=q, key=k, value=v, attn_mask=attn_mask
@@ -171,9 +173,6 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         v_img = self.v_img(context_img).view(b, -1, n, d)
         img_x = flash_attention(q, k_img, v_img, k_lens=None)
         # compute attention
-        base_token_mask = bias_kwargs["base_token_mask"]
-        print(base_token_mask.sum())
-        # x = flash_attention(q, k, v, k_lens=torch.tensor([base_token_mask.sum()]))
         x = flash_attention(q, k, v, k_lens=None)
 
         # output
@@ -186,6 +185,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             x = self.o(x)
             return x
 
+        full_prompt_tokens = bias_kwargs["full_prompt_tokens"]
         tokens_data_list = bias_kwargs["tokens_data_list"]
         simil_masks = bias_kwargs["simil_masks"]
         wlw_matrix = bias_kwargs["wlw_matrix"]
@@ -193,7 +193,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         full_token_mask = bias_kwargs["full_token_mask"]
         y = _calc_cross_attn(
             q,
-            text_tokens=context,
+            text_tokens=full_prompt_tokens,
             main_token_mask=full_token_mask,
             descr_token_data_list=tokens_data_list,
             simil_masks=simil_masks,
@@ -298,7 +298,7 @@ class CustomWanAttentionBlock(nn.Module):
         keys = (
             "bias",
             "beta",
-            "base_token_mask",
+            "full_prompt_tokens",
             "full_token_mask",
             "tokens_data_list",
             "wlw_matrix",
@@ -583,14 +583,15 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         )
         bias_kwargs["wlw_matrix"] = wlw_matrix.to(device)
 
-        # for tokens_data in bias_kwargs["tokens_data_list"]:
-        #     tokens_list = tokens_data["text_tokens"]
-        #     padded_tokens_list = [
-        #         F.pad(tokens, (0, 0, 0, self.text_len - tokens.size(-2)))
-        #         for tokens in tokens_list
-        #     ]
-        #     padded_tokens = torch.stack(padded_tokens_list)
-        #     tokens_data["text_tokens"] = self.text_embedding(padded_tokens)
+        full_prompt_tokens = bias_kwargs["full_prompt_tokens"]
+        full_prompt_tokens = torch.stack(
+            [
+                F.pad(t, (0, 0, 0, self.text_len - t.size(-2)))
+                for t in full_prompt_tokens
+            ]
+        )
+        full_prompt_tokens = self.text_embedding(full_prompt_tokens)
+        bias_kwargs["full_prompt_tokens"] = full_prompt_tokens
 
         # time embeddings
         with torch.amp.autocast("cuda", dtype=torch.float32):

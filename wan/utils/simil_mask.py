@@ -5,6 +5,26 @@ import torch.nn.functional as F
 from einops import einsum, rearrange, reduce
 
 
+def compute_attn_mask(query, key, attn_mask=None, reduction=None):
+    N, L, _, E = query.shape
+    _, S, _, _ = key.shape
+    scale_factor = 1 / math.sqrt(E)
+
+    attn_bias = torch.zeros(N, L, S, dtype=query.dtype, device=query.device)
+    if attn_mask is not None:
+        attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+
+    attn_bias = rearrange(attn_bias, "N L S -> N L 1 S")
+    attn_scores = einsum(query, key, "N L H E, N S H E -> N L H S")
+    attn_scores = scale_factor * attn_scores + attn_bias
+    attn_weights = F.softmax(attn_scores, dim=-1)
+
+    if reduce is not None:
+        attn_weights = reduce(attn_weights, "N L H S -> N L S", reduction=reduction)
+
+    return attn_weights
+
+
 def compute_simil_masks(query, key, face_masks, chunk_size=512):
     def _weighted_average(x, weights, dim):
         weights = weights / weights.sum(dim=dim, keepdim=True).clamp(min=1e-6)
@@ -15,17 +35,13 @@ def compute_simil_masks(query, key, face_masks, chunk_size=512):
 
     sum_attn_weights = query.new_zeros(batch_size, seq_len_q, seq_len_k)
 
-    scale_factor = 1 / math.sqrt(head_dim)
-
     for i in range(0, seq_len_q, chunk_size):
         start_idx = i
         end_idx = min(i + chunk_size, seq_len_q)
         query_chunk = query[:, start_idx:end_idx, :, :]
 
-        attn_scores_chunk = einsum(query_chunk, key, "N L H E, N S H E -> N L H S")
-        attn_weights_chunk = F.softmax(attn_scores_chunk * scale_factor, dim=-1)
+        summed_weights_chunk = compute_attn_mask(query_chunk, key, reduction="sum")
 
-        summed_weights_chunk = reduce(attn_weights_chunk, "N L H S -> N L S", "sum")
         sum_attn_weights[:, start_idx:end_idx, :] += summed_weights_chunk
 
     attn_weights = sum_attn_weights / num_heads
