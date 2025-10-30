@@ -18,18 +18,18 @@ import torchvision.transforms.functional as TF
 from einops import rearrange
 from tqdm import tqdm
 
-from .distributed.fsdp import shard_model
-from .modules.clip import CLIPModel
-from .modules.custom_model import CustomWanModel
-from .modules.t5 import T5EncoderModel
-from .modules.vae import WanVAE
-from .utils.fm_solvers import (
+from ..distributed.fsdp import shard_model
+from ..modules.clip import CLIPModel
+from ..modules.custom_model import CustomWanModel
+from ..modules.t5 import T5EncoderModel
+from ..modules.vae import WanVAE
+from ..utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
     retrieve_timesteps,
 )
-from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-from .utils.subsequence import get_nested_subsequence_mask
+from ..utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from ..utils.subsequence import get_nested_subsequence_mask
 
 
 def find_subsequence(seq, subseq):
@@ -47,7 +47,7 @@ def find_subsequence(seq, subseq):
     return -1
 
 
-class CustomWanI2V:
+class WanI2V:
     def __init__(
         self,
         config,
@@ -372,7 +372,9 @@ class CustomWanI2V:
         cond_kwargs["context"] = context
         cond_kwargs["bias_kwargs"] = bias_kwargs
 
-        [noise_pred_cond], simil_masks = self.model(latent, **cond_kwargs)
+        [noise_pred_cond], simil_masks, ts_attn_weights_map = self.model(
+            latent, **cond_kwargs
+        )
 
         if offload_model:
             noise_pred_cond = noise_pred_cond.to('cpu')
@@ -384,7 +386,7 @@ class CustomWanI2V:
         uncond_kwargs["context"] = context_null
         uncond_kwargs["bias_kwargs"] = bias_kwargs | {"bias": False}
 
-        [noise_pred_uncond], _ = self.model(latent, **uncond_kwargs)
+        [noise_pred_uncond], *_ = self.model(latent, **uncond_kwargs)
 
         if offload_model:
             noise_pred_uncond = noise_pred_uncond.to('cpu')
@@ -394,7 +396,7 @@ class CustomWanI2V:
             noise_pred_cond - noise_pred_uncond
         )
 
-        return noise_pred, simil_masks
+        return noise_pred, simil_masks, ts_attn_weights_map
 
     def generate(
         self,
@@ -491,6 +493,7 @@ class CustomWanI2V:
             timestep_bias_schedule = bias_kwargs.pop("timestep_bias_schedule")
 
             simil_masks_list = []
+            attn_weights_map = {}
 
             self.model.to(self.device)
             for i, t in enumerate(tqdm(timesteps)):
@@ -499,7 +502,7 @@ class CustomWanI2V:
                 timestep = torch.tensor([t], device=self.device)
                 latent = latent.to(self.device)
 
-                noise_pred, simil_masks = self._compute_noise_pred(
+                noise_pred, simil_masks, ts_attn_weights_map = self._compute_noise_pred(
                     [latent],
                     timestep,
                     [y],
@@ -516,8 +519,12 @@ class CustomWanI2V:
                     torch.device('cpu') if offload_model else self.device
                 )
 
-                simil_masks = simil_masks.to('cpu')
+                simil_masks = simil_masks.to("cpu")
                 simil_masks_list.append(simil_masks)
+
+                for inds, attn_weights in ts_attn_weights_map.items():
+                    attn_weights = attn_weights.to("cpu")
+                    attn_weights_map.setdefault(inds, []).append(attn_weights)
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
@@ -547,4 +554,5 @@ class CustomWanI2V:
 
         simil_masks = torch.stack(simil_masks_list, dim=1)
 
-        return (videos[0], simil_masks) if self.rank == 0 else None
+        extra_data = {"simil_masks": simil_masks, "attn_weights_map": attn_weights_map}
+        return (videos[0], extra_data) if self.rank == 0 else None

@@ -8,9 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
-from einops import rearrange, repeat
+from einops import rearrange, reduce, repeat
 
-from ..utils.simil_mask import compute_attn_mask, compute_simil_masks
+from ..utils.simil_mask import compute_attn_weights, compute_simil_masks
 from ..utils.smooth_mask import generate_soft_mask
 from .attention import flash_attention
 from .model import (
@@ -114,12 +114,15 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         ):
             N, _, L = simil_masks.shape
             attn_mask = repeat(main_token_mask, "S -> N L S", N=N, L=L)
-            _, H, W = grid_sizes[0]
+            T, H, W = grid_sizes[0]
 
             k = self.norm_k(self.k(text_tokens))
             v = self.v(text_tokens)
             k = rearrange(k, "N S (H E) -> N S H E", H=self.num_heads, E=self.head_dim)
             v = rearrange(v, "N S (H E) -> N S H E", H=self.num_heads, E=self.head_dim)
+
+            attn_weights = compute_attn_weights(q, k)
+            attn_weights_map = {}
 
             for tokens_data in descr_token_data_list:
                 i, j = tokens_data["inds"]
@@ -131,6 +134,10 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
                 attn_mask = torch.where(
                     a_tokens_mask, attn_mask & a_face_mask, attn_mask
                 )
+                a_attn_weights = torch.where(
+                    a_tokens_mask, attn_weights, torch.zeros_like(attn_weights)
+                )
+                a_attn_weights = reduce(a_attn_weights, "N L S -> N L", reduction="sum")
 
                 b_face_mask = simil_masks[:, j]
                 b_tokens_mask = rearrange(b_tokens_mask, "S -> 1 1 S")
@@ -138,6 +145,16 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
                 attn_mask = torch.where(
                     b_tokens_mask, attn_mask & b_face_mask, attn_mask
                 )
+                b_attn_weights = torch.where(
+                    b_tokens_mask, attn_weights, torch.zeros_like(attn_weights)
+                )
+                b_attn_weights = reduce(b_attn_weights, "N L S -> N L", reduction="sum")
+
+                ab_attn_weights = torch.stack([a_attn_weights, b_attn_weights])
+                ab_attn_weights = rearrange(
+                    ab_attn_weights, "P N (T H W) -> P N T H W", T=T, H=H, W=W
+                )
+                attn_weights_map[(i, j)] = ab_attn_weights
 
                 gaze_token_mask = tokens_data["gaze_token_mask"]
                 gaze_token_mask = rearrange(gaze_token_mask, "S -> 1 1 S")
@@ -158,7 +175,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             # merge heads and channel dims
             y = rearrange(y, "N H L E -> N L (H E)")
 
-            return y
+            return y, attn_weights_map
 
         image_context_length = context.shape[1] - T5_CONTEXT_TOKEN_NUMBER
         context_img = context[:, :image_context_length]
@@ -183,7 +200,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
 
         if not bias_kwargs["bias"]:
             x = self.o(x)
-            return x
+            return x, None
 
         full_prompt_tokens = bias_kwargs["full_prompt_tokens"]
         tokens_data_list = bias_kwargs["tokens_data_list"]
@@ -191,7 +208,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         wlw_matrix = bias_kwargs["wlw_matrix"]
 
         full_token_mask = bias_kwargs["full_token_mask"]
-        y = _calc_cross_attn(
+        y, attn_weights_map = _calc_cross_attn(
             q,
             text_tokens=full_prompt_tokens,
             main_token_mask=full_token_mask,
@@ -209,7 +226,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
 
         # x = self.o(x)
 
-        return x
+        return x, attn_weights_map
 
 
 WAN_CROSSATTENTION_CLASSES = {
@@ -305,16 +322,16 @@ class CustomWanAttentionBlock(nn.Module):
         )
         cross_attn_bias_kwargs = {k: bias_kwargs[k] for k in keys}
         cross_attn_bias_kwargs["simil_masks"] = simil_masks
-
-        x = x + self.cross_attn(
+        x_cross_attn, attn_weights_map = self.cross_attn(
             self.norm3(x), context, grid_sizes, bias_kwargs=cross_attn_bias_kwargs
         )
+        x = x + x_cross_attn
         y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
 
         with torch.amp.autocast("cuda", dtype=torch.float32):
             x = x + y * e[5]
 
-        return x, simil_masks
+        return x, simil_masks, attn_weights_map
 
 
 class Head(nn.Module):
@@ -626,24 +643,35 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         blocks_bias_schedule = bias_kwargs.pop("blocks_bias_schedule")
 
         simil_masks_list = []
+        attn_weights_map = {}
 
         for i, block in enumerate(self.blocks):
-            bias_block = blocks_bias_schedule[i]
+            bias_block = bias and blocks_bias_schedule[i]
 
-            shared_kwargs["bias_kwargs"] = bias_kwargs | {"bias": bias and bias_block}
-            x, simil_masks = block(x, **shared_kwargs)
+            shared_kwargs["bias_kwargs"] = bias_kwargs | {"bias": bias_block}
+            x, simil_masks, block_attn_weights_map = block(x, **shared_kwargs)
 
             simil_masks_list.append(simil_masks)
+
+            if not bias_block:
+                continue
+
+            assert block_attn_weights_map is not None
+            for inds, attn_weights in block_attn_weights_map.items():
+                attn_weights_map.setdefault(inds, []).append(attn_weights)
 
         simil_masks = torch.stack(simil_masks_list, dim=1)
         simil_masks = rearrange(simil_masks, "... (T H W) -> ... T H W", T=T, H=H, W=W)
 
+        avg_attn_weights_map = {}
+        for inds, attn_weights_list in attn_weights_map.items():
+            avg_attn_weights_map[inds] = torch.stack(attn_weights_list).mean(dim=0)
         # head
         x = self.head(x, e)
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
-        return [u.float() for u in x], simil_masks
+        return [u.float() for u in x], simil_masks, avg_attn_weights_map
 
     def unpatchify(self, x, grid_sizes):
         r"""
