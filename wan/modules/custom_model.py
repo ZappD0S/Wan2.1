@@ -196,10 +196,9 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         # this merges heads and channel dims
         x = x.flatten(2)
         img_x = img_x.flatten(2)
-        x = x + img_x
 
         if not bias_kwargs["bias"]:
-            x = self.o(x)
+            x = self.o(x + img_x)
             return x, None
 
         full_prompt_tokens = bias_kwargs["full_prompt_tokens"]
@@ -219,12 +218,12 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
 
         beta = bias_kwargs["beta"]
 
-        x = self.o(x)
-        y = self.o(y)
+        x = self.o(x + img_x)
+        y = self.o(y + img_x)
 
         x = (1 - beta) * x + beta * y
 
-        # x = self.o(x)
+        # x = self.o(x + img_x)
 
         return x, attn_weights_map
 
