@@ -117,9 +117,7 @@ class WanI2V:
         )
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = CustomWanModel.from_pretrained(
-            checkpoint_dir, torch_dtype=config.param_dtype
-        )
+        self.model = CustomWanModel.from_pretrained(checkpoint_dir, torch_dtype=config.param_dtype)
 
         self.model.eval().requires_grad_(False)
 
@@ -137,9 +135,7 @@ class WanI2V:
             )
 
             for block in self.model.blocks:
-                block.self_attn.forward = types.MethodType(
-                    usp_attn_forward, block.self_attn
-                )
+                block.self_attn.forward = types.MethodType(usp_attn_forward, block.self_attn)
             self.model.forward = types.MethodType(usp_dit_forward, self.model)
             self.sp_size = get_sequence_parallel_world_size()
         else:
@@ -232,69 +228,42 @@ class WanI2V:
         tokens_data_list = []
         tokenizer = self.text_encoder.tokenizer
 
-        link_text = bias_kwargs.pop("link_text")
-        descr_list = bias_kwargs.pop("descr_list")
+        control_prompts = bias_kwargs.pop("control_prompts")
 
-        n_characters = len(descr_list)
+        full_prompt_tokens = self.text_encoder([base_prompt], t5_device)
+        full_prompt = " ".join(
+            [base_prompt] + [d["prompt"] for d in control_prompts.values()]
+        ).strip()
 
-        gaze_prompts = []
-        gaze_prompt_data = {}
-        for i, j in permutations(range(n_characters), r=2):
-            a_descr, b_descr = descr_list[i], descr_list[j]
-            a_descr = a_descr.capitalize()
-            gaze_prompt = " ".join([a_descr, link_text, b_descr]) + "."
-            gaze_prompts.append(gaze_prompt)
+        [full_token_ids], [full_token_mask] = tokenizer(
+            full_prompt, return_mask=True, return_tensors="np"
+        )
+        full_token_mask = torch.from_numpy(full_token_mask).to(dtype=bool, device=self.device)
 
+        for (i, j), prompt_data in control_prompts.items():
             [gaze_token_ids] = tokenizer(
-                gaze_prompt,
+                prompt_data["prompt"],
                 padding=False,
                 add_special_tokens=False,
                 return_tensors="np",
             )
-            descr_token_ids_list = []
-            for descr in [a_descr, b_descr]:
+
+            gaze_token_mask = get_nested_subsequence_mask(full_token_ids, [gaze_token_ids])
+            gaze_token_mask = torch.from_numpy(gaze_token_mask).to(dtype=bool, device=self.device)
+
+            descr_masks_list = []
+            for descr in prompt_data["descr_list"]:
                 [descr_token_ids] = tokenizer(
                     descr,
                     padding=False,
                     add_special_tokens=False,
                     return_tensors="np",
                 )
-                descr_token_ids_list.append(descr_token_ids)
 
-            gaze_prompt_data[(i, j)] = {
-                "gaze_token_ids": gaze_token_ids,
-                "descr_token_ids_list": descr_token_ids_list,
-            }
-
-        full_prompt = " ".join([base_prompt, *gaze_prompts])
-        full_prompt_tokens = self.text_encoder([base_prompt], t5_device)
-
-        [full_token_ids], [full_token_mask] = tokenizer(
-            full_prompt, return_mask=True, return_tensors="np"
-        )
-        full_token_mask = torch.from_numpy(full_token_mask).to(
-            dtype=bool, device=self.device
-        )
-
-        for (i, j), ids_dict in gaze_prompt_data.items():
-            gaze_token_ids = ids_dict["gaze_token_ids"]
-            descr_token_ids_list = ids_dict["descr_token_ids_list"]
-
-            gaze_token_mask = get_nested_subsequence_mask(
-                full_token_ids, [gaze_token_ids]
-            )
-            gaze_token_mask = torch.from_numpy(gaze_token_mask).to(
-                dtype=bool, device=self.device
-            )
-
-            descr_masks_list = []
-            for descr_token_ids in descr_token_ids_list:
                 descr_mask = get_nested_subsequence_mask(
                     full_token_ids, [gaze_token_ids, descr_token_ids]
                 )
-                descr_mask = torch.from_numpy(descr_mask).to(
-                    dtype=bool, device=self.device
-                )
+                descr_mask = torch.from_numpy(descr_mask).to(dtype=bool, device=self.device)
                 assert not (descr_mask & (~gaze_token_mask)).any()
                 descr_masks_list.append(descr_mask)
 
@@ -329,9 +298,7 @@ class WanI2V:
                 shift=1,
                 use_dynamic_shifting=False,
             )
-            sample_scheduler.set_timesteps(
-                sampling_steps, device=self.device, shift=shift
-            )
+            sample_scheduler.set_timesteps(sampling_steps, device=self.device, shift=shift)
             timesteps = sample_scheduler.timesteps
         elif sample_solver == 'dpm++':
             sample_scheduler = FlowDPMSolverMultistepScheduler(
@@ -372,9 +339,7 @@ class WanI2V:
         cond_kwargs["context"] = context
         cond_kwargs["bias_kwargs"] = bias_kwargs
 
-        [noise_pred_cond], simil_masks, ts_attn_weights_map = self.model(
-            latent, **cond_kwargs
-        )
+        [noise_pred_cond], simil_masks, ts_attn_weights_map = self.model(latent, **cond_kwargs)
 
         if offload_model:
             noise_pred_cond = noise_pred_cond.to('cpu')
@@ -392,9 +357,7 @@ class WanI2V:
             noise_pred_uncond = noise_pred_uncond.to('cpu')
             torch.cuda.empty_cache()
 
-        noise_pred = noise_pred_uncond + guide_scale * (
-            noise_pred_cond - noise_pred_uncond
-        )
+        noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
         return noise_pred, simil_masks, ts_attn_weights_map
 
@@ -481,9 +444,7 @@ class WanI2V:
             torch.no_grad(),
             no_sync(),
         ):
-            sample_scheduler, timesteps = self._get_scheduler(
-                sample_solver, sampling_steps, shift
-            )
+            sample_scheduler, timesteps = self._get_scheduler(sample_solver, sampling_steps, shift)
             # sample videos
             latent = noise
 
@@ -515,9 +476,7 @@ class WanI2V:
                     offload_model=offload_model,
                 )
 
-                latent = latent.to(
-                    torch.device('cpu') if offload_model else self.device
-                )
+                latent = latent.to(torch.device('cpu') if offload_model else self.device)
 
                 simil_masks = simil_masks.to("cpu")
                 simil_masks_list.append(simil_masks)
