@@ -1,5 +1,4 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
-import gc
 import math
 
 # from copy import deepcopy
@@ -11,7 +10,6 @@ from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange, reduce, repeat
 
 from ..utils.simil_mask import compute_attn_weights, compute_simil_masks
-from ..utils.smooth_mask import generate_soft_mask
 from .attention import flash_attention
 from .model import (
     WanLayerNorm,
@@ -105,21 +103,11 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         """
 
         def _calc_cross_attn(
-            q,
-            text_tokens,
-            main_token_mask,
-            descr_token_data_list,
-            simil_masks,
-            wlw_matrix,
+            q, k, v, main_token_mask, descr_token_data_list, simil_masks, wlw_matrix
         ):
-            N, _, L = simil_masks.shape
-            attn_mask = repeat(main_token_mask, "S -> N L S", N=N, L=L)
+            N, L, _, _ = q.shape
+            attn_mask = repeat(torch.ones_like(main_token_mask), "S -> N L S", N=N, L=L)
             T, H, W = grid_sizes[0]
-
-            k = self.norm_k(self.k(text_tokens))
-            v = self.v(text_tokens)
-            k = rearrange(k, "N S (H E) -> N S H E", H=self.num_heads, E=self.head_dim)
-            v = rearrange(v, "N S (H E) -> N S H E", H=self.num_heads, E=self.head_dim)
 
             attn_weights = compute_attn_weights(q, k)
             attn_weights_map = {}
@@ -202,14 +190,18 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             return x, None
 
         full_prompt_tokens = bias_kwargs["full_prompt_tokens"]
+        k_full = self.norm_k(self.k(full_prompt_tokens)).view(b, -1, n, d)
+        v_full = self.v(full_prompt_tokens).view(b, -1, n, d)
+
         tokens_data_list = bias_kwargs["tokens_data_list"]
         simil_masks = bias_kwargs["simil_masks"]
         wlw_matrix = bias_kwargs["wlw_matrix"]
-
         full_token_mask = bias_kwargs["full_token_mask"]
+
         y, attn_weights_map = _calc_cross_attn(
             q,
-            text_tokens=full_prompt_tokens,
+            k_full,
+            v_full,
             main_token_mask=full_token_mask,
             descr_token_data_list=tokens_data_list,
             simil_masks=simil_masks,
@@ -218,12 +210,12 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
 
         beta = bias_kwargs["beta"]
 
-        x = self.o(x + img_x)
-        y = self.o(y + img_x)
+        # x = self.o(x + img_x)
+        # y = self.o(y + img_x)
 
         x = (1 - beta) * x + beta * y
 
-        # x = self.o(x + img_x)
+        x = self.o(x + img_x)
 
         return x, attn_weights_map
 
@@ -602,8 +594,8 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         full_prompt_tokens = bias_kwargs["full_prompt_tokens"]
         full_prompt_tokens = torch.stack(
             [
-                F.pad(t, (0, 0, 0, self.text_len - t.size(-2)))
-                for t in full_prompt_tokens
+                torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                for u in full_prompt_tokens
             ]
         )
         full_prompt_tokens = self.text_embedding(full_prompt_tokens)

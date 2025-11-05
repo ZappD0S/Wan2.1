@@ -6,11 +6,11 @@ from einops import einsum, rearrange, reduce
 
 
 def compute_attn_weights(query, key, chunk_size=512):
-    N, L, H, E = query.shape
+    N, L, _, E = query.shape
     _, S, _, _ = key.shape
     scale_factor = 1.0 / math.sqrt(E)
 
-    summed_attn_weights = query.new_zeros(N, L, S)
+    avg_attn_weights = query.new_empty(N, L, S)
     for i in range(0, L, chunk_size):
         start = i
         end = min(i + chunk_size, L)
@@ -18,11 +18,9 @@ def compute_attn_weights(query, key, chunk_size=512):
 
         attn_scores_chunk = einsum(query_chunk, key, "N L H E, N S H E -> N L H S")
         attn_weights_chunk = F.softmax(scale_factor * attn_scores_chunk, dim=-1)
-        summed_attn_weights[:, start:end, :] += reduce(
-            attn_weights_chunk, "N L H S -> N L S", reduction="sum"
+        avg_attn_weights[:, start:end, :] = reduce(
+            attn_weights_chunk, "N L H S -> N L S", reduction="mean"
         )
-
-    avg_attn_weights = summed_attn_weights / H
 
     return avg_attn_weights
 
