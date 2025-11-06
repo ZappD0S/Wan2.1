@@ -106,47 +106,42 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             q, k, v, main_token_mask, descr_token_data_list, simil_masks, wlw_matrix
         ):
             N, L, _, _ = q.shape
-            attn_mask = repeat(torch.ones_like(main_token_mask), "S -> N L S", N=N, L=L)
+            attn_mask = repeat(
+                torch.ones_like(main_token_mask), "S -> N L S", N=N, L=L
+            ).contiguous()
             T, H, W = grid_sizes[0]
 
             attn_weights = compute_attn_weights(q, k)
             attn_weights_map = {}
 
             for tokens_data in descr_token_data_list:
-                i, j = tokens_data["inds"]
-                a_tokens_mask, b_tokens_mask = tokens_data["descr_token_masks"]
+                inds = tokens_data["inds"]
+                descr_token_masks = tokens_data["descr_token_masks"]
 
-                a_face_mask = simil_masks[:, i]
-                a_tokens_mask = rearrange(a_tokens_mask, "S -> 1 1 S")
-                a_face_mask = rearrange(a_face_mask, "N L -> N L 1")
-                attn_mask = torch.where(
-                    a_tokens_mask, attn_mask & a_face_mask, attn_mask
-                )
-                a_attn_weights = torch.where(
-                    a_tokens_mask, attn_weights, torch.zeros_like(attn_weights)
-                )
-                a_attn_weights = reduce(a_attn_weights, "N L S -> N L", reduction="sum")
+                attn_weights_list = []
+                for i, tokens_mask in zip(inds, descr_token_masks):
+                    face_mask = simil_masks[:, i]
+                    tokens_mask = rearrange(tokens_mask, "S -> 1 1 S")
+                    face_mask = rearrange(face_mask, "N L -> N L 1")
+                    attn_mask = torch.where(
+                        tokens_mask, attn_mask & face_mask, attn_mask
+                    )
+                    masked_attn_weights = torch.where(
+                        tokens_mask, attn_weights, torch.zeros_like(attn_weights)
+                    )
+                    masked_attn_weights = reduce(
+                        masked_attn_weights, "N L S -> N L", reduction="sum"
+                    )
+                    masked_attn_weights = rearrange(
+                        masked_attn_weights, "N (T H W) -> N T H W", T=T, H=H, W=W
+                    )
+                    attn_weights_list.append(masked_attn_weights)
 
-                b_face_mask = simil_masks[:, j]
-                b_tokens_mask = rearrange(b_tokens_mask, "S -> 1 1 S")
-                b_face_mask = rearrange(b_face_mask, "N L -> N L 1")
-                attn_mask = torch.where(
-                    b_tokens_mask, attn_mask & b_face_mask, attn_mask
-                )
-                b_attn_weights = torch.where(
-                    b_tokens_mask, attn_weights, torch.zeros_like(attn_weights)
-                )
-                b_attn_weights = reduce(b_attn_weights, "N L S -> N L", reduction="sum")
-
-                ab_attn_weights = torch.stack([a_attn_weights, b_attn_weights])
-                ab_attn_weights = rearrange(
-                    ab_attn_weights, "P N (T H W) -> P N T H W", T=T, H=H, W=W
-                )
-                attn_weights_map[(i, j)] = ab_attn_weights
+                attn_weights_map[inds] = torch.stack(attn_weights_list)
 
                 gaze_token_mask = tokens_data["gaze_token_mask"]
                 gaze_token_mask = rearrange(gaze_token_mask, "S -> 1 1 S")
-                time_mask = wlw_matrix[i, j]
+                time_mask = wlw_matrix[inds]
                 time_mask = repeat(time_mask, "T -> 1 (T H W) 1", H=H, W=W)
                 attn_mask = torch.where(
                     gaze_token_mask, attn_mask & time_mask, attn_mask

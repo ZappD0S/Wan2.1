@@ -198,9 +198,7 @@ class WanI2V:
         )
 
         padding_frames = torch.zeros(3, frame_num - 1, h, w)
-        resized_img = torch.nn.functional.interpolate(
-            img.unsqueeze(0).cpu(), size=(h, w), mode="bicubic"
-        )
+        resized_img = F.interpolate(img.unsqueeze(0).cpu(), size=(h, w), mode="bicubic")
         resized_img = rearrange(resized_img, "1 C H W -> C 1 H W")
 
         input_sequence = torch.concat([resized_img, padding_frames], dim=1)
@@ -247,7 +245,7 @@ class WanI2V:
             dtype=torch.bool, device=self.device
         )
 
-        for (i, j), prompt_data in control_prompts.items():
+        for inds, prompt_data in control_prompts.items():
             [gaze_token_ids] = tokenizer(
                 prompt_data["prompt"],
                 padding=False,
@@ -282,7 +280,7 @@ class WanI2V:
 
             tokens_data_list.append(
                 {
-                    "inds": (i, j),
+                    "inds": inds,
                     "gaze_token_mask": gaze_token_mask,
                     "descr_token_masks": descr_masks_list,
                 }
