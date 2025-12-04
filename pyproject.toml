@@ -56,6 +56,9 @@ packages = ["wan"]
 [tool.setuptools.package-data]
 "wan" = ["**/*.py"]
 
+[tool.pyright]
+typeCheckingMode = "standard"
+
 [tool.black]
 line-length = 88
 

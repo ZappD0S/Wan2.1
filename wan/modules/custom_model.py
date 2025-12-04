@@ -117,6 +117,25 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             for tokens_data in descr_token_data_list:
                 inds = tokens_data["inds"]
                 descr_token_masks = tokens_data["descr_token_masks"]
+                gaze_token_mask = tokens_data["gaze_token_mask"]
+                gaze_token_mask = rearrange(gaze_token_mask, "S -> 1 1 S")
+
+                single_ind = len(inds) == 1
+
+                time_mask = wlw_matrix[inds * 2 if single_ind else inds]
+                time_mask = repeat(time_mask, "T -> 1 (T H W) 1", H=H, W=W)
+                attn_mask = torch.where(
+                    gaze_token_mask, attn_mask & time_mask, attn_mask
+                )
+
+                if single_ind:
+                    [i] = inds
+                    face_mask = simil_masks[:, i]
+                    face_mask = rearrange(face_mask, "N L -> N L 1")
+                    attn_mask = torch.where(
+                        gaze_token_mask, attn_mask & face_mask, attn_mask
+                    )
+                    continue
 
                 attn_weights_list = []
                 for i, tokens_mask in zip(inds, descr_token_masks):
@@ -138,14 +157,6 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
                     attn_weights_list.append(masked_attn_weights)
 
                 attn_weights_map[inds] = torch.stack(attn_weights_list)
-
-                gaze_token_mask = tokens_data["gaze_token_mask"]
-                gaze_token_mask = rearrange(gaze_token_mask, "S -> 1 1 S")
-                time_mask = wlw_matrix[inds]
-                time_mask = repeat(time_mask, "T -> 1 (T H W) 1", H=H, W=W)
-                attn_mask = torch.where(
-                    gaze_token_mask, attn_mask & time_mask, attn_mask
-                )
 
             # the head before seq_len is necessary for scaled_dot_product_attention
             q = rearrange(q, "N L H E -> N H L E")
