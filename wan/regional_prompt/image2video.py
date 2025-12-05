@@ -8,7 +8,6 @@ import sys
 import types
 from contextlib import contextmanager
 from functools import partial
-from itertools import permutations
 
 import numpy as np
 import torch
@@ -30,6 +29,9 @@ from ..utils.fm_solvers import (
 )
 from ..utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from ..utils.subsequence import get_nested_subsequence_mask
+
+
+NEGATIVE_PROMPT = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 
 
 def find_subsequence(seq, subseq):
@@ -131,7 +133,7 @@ class WanI2V:
                 get_sequence_parallel_world_size,
             )
 
-            from .distributed.xdit_context_parallel import (
+            from .distributed.xdit_context_parallel import (  # type: ignore
                 usp_attn_forward,
                 usp_dit_forward,
             )
@@ -212,7 +214,7 @@ class WanI2V:
 
         return noise, y, face_masks, max_seq_len
 
-    def _build_context(self, img, base_prompt, n_prompt, bias_kwargs, offload_model):
+    def _build_context(self, img, prompt, n_prompt, bias_kwargs, offload_model):
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
@@ -223,7 +225,7 @@ class WanI2V:
             t5_device = self.device
 
         context_null = self.text_encoder([n_prompt], t5_device)
-        context = self.text_encoder([base_prompt], t5_device)
+        context = self.text_encoder([prompt], t5_device)
 
         bias_kwargs = bias_kwargs.copy()
 
@@ -232,21 +234,18 @@ class WanI2V:
 
         control_prompts = bias_kwargs.pop("control_prompts")
 
-        prompts_parts = [base_prompt] + [d["prompt"] for d in control_prompts.values()]
-        full_prompt = " ".join(prompts_parts).strip()
-        print(f'full_prompt: "{full_prompt}"')
-
-        full_prompt_tokens = self.text_encoder([full_prompt], t5_device)
+        prompts_parts = [d["prompt"] for d in control_prompts.values()]
+        assert " ".join(prompts_parts) == prompt
 
         [full_token_ids], [full_token_mask] = tokenizer(
-            full_prompt, return_mask=True, return_tensors="np"
+            prompt, return_mask=True, return_tensors="np"
         )
         full_token_mask = torch.from_numpy(full_token_mask).to(
             dtype=torch.bool, device=self.device
         )
 
         for inds, prompt_data in control_prompts.items():
-            [gaze_token_ids] = tokenizer(
+            [gaze_token_ids] = tokenizer(  # type: ignore
                 prompt_data["prompt"],
                 padding=False,
                 add_special_tokens=False,
@@ -257,12 +256,12 @@ class WanI2V:
                 full_token_ids, [gaze_token_ids]
             )
             gaze_token_mask = torch.from_numpy(gaze_token_mask).to(
-                dtype=bool, device=self.device
+                dtype=torch.bool, device=self.device
             )
 
             descr_masks_list = []
             for descr in prompt_data["descr_list"]:
-                [descr_token_ids] = tokenizer(
+                [descr_token_ids] = tokenizer(  # type: ignore
                     descr,
                     padding=False,
                     add_special_tokens=False,
@@ -273,7 +272,7 @@ class WanI2V:
                     full_token_ids, [gaze_token_ids, descr_token_ids]
                 )
                 descr_mask = torch.from_numpy(descr_mask).to(
-                    dtype=bool, device=self.device
+                    dtype=torch.bool, device=self.device
                 )
                 assert not (descr_mask & (~gaze_token_mask)).any()
                 descr_masks_list.append(descr_mask)
@@ -289,15 +288,15 @@ class WanI2V:
         if self.t5_cpu:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
-            full_prompt_tokens = [t.to(self.device) for t in full_prompt_tokens]
+
         self.clip.model.to(self.device)
         clip_context = self.clip.visual([img[:, None, :, :]])
+
         if offload_model:
             self.clip.model.cpu()
             torch.cuda.empty_cache()
 
         bias_kwargs["tokens_data_list"] = tokens_data_list
-        bias_kwargs["full_prompt_tokens"] = full_prompt_tokens
         bias_kwargs["full_token_mask"] = full_token_mask
 
         return context, context_null, clip_context, bias_kwargs
@@ -380,7 +379,7 @@ class WanI2V:
 
     def generate(
         self,
-        input_prompt,
+        prompt,
         img,
         bias_kwargs,
         max_area=720 * 1280,
@@ -389,7 +388,7 @@ class WanI2V:
         sample_solver='unipc',
         sampling_steps=40,
         guide_scale=5.0,
-        n_prompt="",
+        n_prompt=NEGATIVE_PROMPT,
         seed=-1,
         offload_model=True,
     ):
@@ -443,7 +442,7 @@ class WanI2V:
 
         context, context_null, clip_context, bias_kwargs = self._build_context(
             img,
-            input_prompt,
+            prompt,
             n_prompt,
             bias_kwargs=bias_kwargs,
             offload_model=offload_model,
@@ -457,7 +456,7 @@ class WanI2V:
 
         # evaluation mode
         with (
-            torch.amp.autocast("cuda", dtype=self.param_dtype),
+            torch.autocast("cuda", dtype=self.param_dtype),
             torch.no_grad(),
             no_sync(),
         ):
@@ -519,6 +518,7 @@ class WanI2V:
                 self.model.cpu()
                 torch.cuda.empty_cache()
 
+            videos = [None]
             if self.rank == 0:
                 videos = self.vae.decode([latent.to(self.device)])
 

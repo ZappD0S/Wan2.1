@@ -1,7 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
 
-# from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -95,7 +94,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         # self.alpha = nn.Parameter(torch.zeros((1, )))
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, context, grid_sizes, bias_kwargs):
+    def forward(self, x, context, grid_sizes, bias_kwargs):  # type: ignore
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -195,10 +194,6 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             x = self.o(x + img_x)
             return x, None
 
-        full_prompt_tokens = bias_kwargs["full_prompt_tokens"]
-        k_full = self.norm_k(self.k(full_prompt_tokens)).view(b, -1, n, d)
-        v_full = self.v(full_prompt_tokens).view(b, -1, n, d)
-
         tokens_data_list = bias_kwargs["tokens_data_list"]
         simil_masks = bias_kwargs["simil_masks"]
         wlw_matrix = bias_kwargs["wlw_matrix"]
@@ -206,8 +201,8 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
 
         y, attn_weights_map = _calc_cross_attn(
             q,
-            k_full,
-            v_full,
+            k,
+            v,
             main_token_mask=full_token_mask,
             descr_token_data_list=tokens_data_list,
             simil_masks=simil_masks,
@@ -287,45 +282,34 @@ class CustomWanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast("cuda", dtype=torch.float32):
+        with torch.autocast("cuda", dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
         # self-attention
-
-        keys = ("bias", "face_masks")
-        self_attn_bias_kwargs = {k: bias_kwargs[k] for k in keys}
 
         y, simil_masks = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0],
             seq_lens,
             grid_sizes,
             freqs,
-            bias_kwargs=self_attn_bias_kwargs,
+            bias_kwargs=bias_kwargs,
         )
 
-        with torch.amp.autocast("cuda", dtype=torch.float32):
+        with torch.autocast("cuda", dtype=torch.float32):
             x = x + y * e[2]
 
         # cross-attention & ffn
 
-        keys = (
-            "bias",
-            "beta",
-            "full_prompt_tokens",
-            "full_token_mask",
-            "tokens_data_list",
-            "wlw_matrix",
-        )
-        cross_attn_bias_kwargs = {k: bias_kwargs[k] for k in keys}
-        cross_attn_bias_kwargs["simil_masks"] = simil_masks
+        bias_kwargs = bias_kwargs.copy()
+        bias_kwargs["simil_masks"] = simil_masks
         x_cross_attn, attn_weights_map = self.cross_attn(
-            self.norm3(x), context, grid_sizes, bias_kwargs=cross_attn_bias_kwargs
+            self.norm3(x), context, grid_sizes, bias_kwargs=bias_kwargs
         )
         x = x + x_cross_attn
         y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
 
-        with torch.amp.autocast("cuda", dtype=torch.float32):
+        with torch.autocast("cuda", dtype=torch.float32):
             x = x + y * e[5]
 
         return x, simil_masks, attn_weights_map
@@ -356,7 +340,7 @@ class Head(nn.Module):
             e(Tensor): Shape [B, C]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast("cuda", dtype=torch.float32):
+        with torch.autocast("cuda", dtype=torch.float32):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = self.head(self.norm(x) * (1 + e[1]) + e[0])
         return x
@@ -530,7 +514,7 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
-    def forward(self, x, t, context, seq_len, clip_fea=None, y=None, bias_kwargs=None):
+    def forward(self, x, t, context, seq_len, bias_kwargs, clip_fea=None, y=None):
         r"""
         Forward pass through the diffusion model
 
@@ -578,7 +562,7 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         )
 
         bias_kwargs = bias_kwargs.copy()
-        T, H, W = grid_sizes[0]
+        T, H, W = [int(s) for s in grid_sizes[0]]
 
         face_masks = bias_kwargs["face_masks"]
         face_masks = rearrange(face_masks.float(), "N H W -> N 1 H W")
@@ -597,18 +581,8 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         )
         bias_kwargs["wlw_matrix"] = wlw_matrix.to(device)
 
-        full_prompt_tokens = bias_kwargs["full_prompt_tokens"]
-        full_prompt_tokens = torch.stack(
-            [
-                torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                for u in full_prompt_tokens
-            ]
-        )
-        full_prompt_tokens = self.text_embedding(full_prompt_tokens)
-        bias_kwargs["full_prompt_tokens"] = full_prompt_tokens
-
         # time embeddings
-        with torch.amp.autocast("cuda", dtype=torch.float32):
+        with torch.autocast("cuda", dtype=torch.float32):
             e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
