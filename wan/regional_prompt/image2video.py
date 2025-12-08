@@ -98,7 +98,7 @@ class WanI2V:
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
-            device=torch.device('cpu'),
+            device=torch.device('cpu'),  # pyright: ignore[reportArgumentType]
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
             shard_fn=shard_fn if t5_fsdp else None,
@@ -108,7 +108,7 @@ class WanI2V:
         self.patch_size = config.patch_size
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device,
+            device=self.device,  # pyright: ignore[reportArgumentType]
         )
 
         self.clip = CLIPModel(
@@ -119,6 +119,7 @@ class WanI2V:
         )
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
+        self.model: CustomWanModel
         self.model = CustomWanModel.from_pretrained(
             checkpoint_dir, torch_dtype=config.param_dtype
         )
@@ -139,7 +140,7 @@ class WanI2V:
             )
 
             for block in self.model.blocks:
-                block.self_attn.forward = types.MethodType(
+                block.self_attn.forward = types.MethodType(  # pyright: ignore[reportAttributeAccessIssue]
                     usp_attn_forward, block.self_attn
                 )
             self.model.forward = types.MethodType(usp_dit_forward, self.model)
@@ -150,10 +151,10 @@ class WanI2V:
         if dist.is_initialized():
             dist.barrier()
         if dit_fsdp:
-            self.model = shard_fn(self.model)
+            self.model = shard_fn(self.model)  # pyright: ignore[reportAttributeAccessIssue]
         else:
             if not init_on_cpu:
-                self.model.to(self.device)
+                self.model.to(self.device)  # pyright: ignore[reportArgumentType]
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
@@ -474,7 +475,7 @@ class WanI2V:
             simil_masks_list = []
             attn_weights_map = {}
 
-            self.model.to(self.device)
+            self.model.to(self.device)  # pyright: ignore[reportArgumentType]
             for i, t in enumerate(tqdm(timesteps)):
                 bias_timestep = timestep_bias_schedule[i]
 
