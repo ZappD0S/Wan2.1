@@ -136,6 +136,9 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
                     )
                     continue
 
+                if not descr_token_masks:
+                    raise ValueError
+
                 attn_weights_list = []
                 for i, tokens_mask in zip(inds, descr_token_masks):
                     face_mask = simil_masks[:, i]

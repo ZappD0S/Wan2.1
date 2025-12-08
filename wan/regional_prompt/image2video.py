@@ -235,9 +235,6 @@ class WanI2V:
 
         control_prompts = bias_kwargs.pop("control_prompts")
 
-        prompts_parts = [d["prompt"] for d in control_prompts.values()]
-        assert " ".join(prompts_parts) == prompt
-
         [full_token_ids], [full_token_mask] = tokenizer(
             prompt, return_mask=True, return_tensors="np"
         )
