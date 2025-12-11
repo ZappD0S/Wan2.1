@@ -206,7 +206,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             # merge heads and channel dims
             y = rearrange(y, "N H L E -> N L (H E)")
 
-            beta = bias_kwargs["regional_prompting"]["beta"]
+            beta = bias_kwargs["beta"]
             # NOTE: since self.o is just a linear (no activation function) it doesn't matter if
             # we apply before or after computing this sum
             x = (1 - beta) * x + beta * y
@@ -218,7 +218,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             v = rearrange(v, "N S H E -> N H S E")
 
             norm_t = bias_kwargs["normalized_timestep"]
-            strength = bias_kwargs["ediff-i"]["strength"]
+            strength = bias_kwargs["strength"]
             attn_mask = strength * norm_t * attn_mask.float()
             x = F.scaled_dot_product_attention(
                 query=q, key=k, value=v, attn_mask=attn_mask
