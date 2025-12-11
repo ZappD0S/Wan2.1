@@ -8,7 +8,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange, repeat
 
-from ..utils.simil_mask import compute_attn_weights, compute_simil_masks
+from ..utils.simil_mask import compute_simil_masks
 from .attention import flash_attention
 from .model import (
     WanLayerNorm,
@@ -138,7 +138,6 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
                 if not descr_token_masks:
                     raise ValueError
 
-                attn_weights_list = []
                 for i, tokens_mask in zip(inds, descr_token_masks):
                     face_mask = simil_masks[:, i]
                     tokens_mask = rearrange(tokens_mask, "S -> 1 1 S")
