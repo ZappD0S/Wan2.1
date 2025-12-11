@@ -479,6 +479,9 @@ class WanI2V:
                 timestep = torch.tensor([t], device=self.device)
                 latent = latent.to(self.device)
 
+                print(timestep)
+                norm_t = timestep / sampling_steps
+                assert (0.0 <= norm_t) and (norm_t <= 1.0)
                 noise_pred, simil_masks, ts_attn_weights_map = self._compute_noise_pred(
                     [latent],
                     timestep,
@@ -486,7 +489,8 @@ class WanI2V:
                     context=context,
                     context_null=context_null,
                     clip_context=clip_context,
-                    bias_kwargs=bias_kwargs | {"bias": bias_timestep},
+                    bias_kwargs=bias_kwargs
+                    | {"normalized_timestep": norm_t, "bias": bias_timestep},
                     max_seq_len=max_seq_len,
                     guide_scale=guide_scale,
                     offload_model=offload_model,
