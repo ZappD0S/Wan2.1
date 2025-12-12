@@ -315,7 +315,7 @@ class CustomWanAttentionBlock(nn.Module):
 
         bias_kwargs = bias_kwargs.copy()
         bias_kwargs["simil_masks"] = simil_masks
-        x_cross_attn, attn_weights_map = self.cross_attn(
+        x_cross_attn = self.cross_attn(
             self.norm3(x), context, grid_sizes, bias_kwargs=bias_kwargs
         )
         x = x + x_cross_attn
@@ -324,7 +324,7 @@ class CustomWanAttentionBlock(nn.Module):
         with torch.autocast("cuda", dtype=torch.float32):
             x = x + y * e[5]
 
-        return x, simil_masks, attn_weights_map
+        return x, simil_masks
 
 
 class Head(nn.Module):
@@ -626,35 +626,27 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         blocks_bias_schedule = bias_kwargs.pop("blocks_bias_schedule")
 
         simil_masks_list = []
-        attn_weights_map = {}
 
         for i, block in enumerate(self.blocks):
             bias_block = bias and blocks_bias_schedule[i]
 
             shared_kwargs["bias_kwargs"] = bias_kwargs | {"bias": bias_block}
-            x, simil_masks, block_attn_weights_map = block(x, **shared_kwargs)
+            x, simil_masks = block(x, **shared_kwargs)
 
             simil_masks_list.append(simil_masks)
 
             if not bias_block:
                 continue
 
-            assert block_attn_weights_map is not None
-            for inds, attn_weights in block_attn_weights_map.items():
-                attn_weights_map.setdefault(inds, []).append(attn_weights)
-
         simil_masks = torch.stack(simil_masks_list, dim=1)
         simil_masks = rearrange(simil_masks, "... (T H W) -> ... T H W", T=T, H=H, W=W)
 
-        avg_attn_weights_map = {}
-        for inds, attn_weights_list in attn_weights_map.items():
-            avg_attn_weights_map[inds] = torch.stack(attn_weights_list).mean(dim=0)
         # head
         x = self.head(x, e)
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
-        return [u.float() for u in x], simil_masks, avg_attn_weights_map
+        return [u.float() for u in x], simil_masks
 
     def unpatchify(self, x, grid_sizes):
         r"""

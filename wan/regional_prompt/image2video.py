@@ -349,9 +349,7 @@ class WanI2V:
         cond_kwargs["context"] = context
         cond_kwargs["bias_kwargs"] = bias_kwargs
 
-        [noise_pred_cond], simil_masks, ts_attn_weights_map = self.model(
-            latent, **cond_kwargs
-        )
+        [noise_pred_cond], simil_masks = self.model(latent, **cond_kwargs)
 
         if offload_model:
             noise_pred_cond = noise_pred_cond.to('cpu')
@@ -373,7 +371,7 @@ class WanI2V:
             noise_pred_cond - noise_pred_uncond
         )
 
-        return noise_pred, simil_masks, ts_attn_weights_map
+        return noise_pred, simil_masks
 
     def generate(
         self,
@@ -470,7 +468,6 @@ class WanI2V:
             timestep_bias_schedule = bias_kwargs.pop("timestep_bias_schedule")
 
             simil_masks_list = []
-            attn_weights_map = {}
 
             self.model.to(self.device)  # pyright: ignore[reportArgumentType]
             for i, t in enumerate(tqdm(timesteps)):
@@ -482,7 +479,7 @@ class WanI2V:
                 print(timestep)
                 norm_t = timestep / self.num_train_timesteps
                 assert (0.0 <= norm_t) and (norm_t <= 1.0)
-                noise_pred, simil_masks, ts_attn_weights_map = self._compute_noise_pred(
+                noise_pred, simil_masks = self._compute_noise_pred(
                     [latent],
                     timestep,
                     [y],
@@ -502,10 +499,6 @@ class WanI2V:
 
                 simil_masks = simil_masks.to("cpu")
                 simil_masks_list.append(simil_masks)
-
-                for inds, attn_weights in ts_attn_weights_map.items():
-                    attn_weights = attn_weights.to("cpu")
-                    attn_weights_map.setdefault(inds, []).append(attn_weights)
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
@@ -536,5 +529,5 @@ class WanI2V:
 
         simil_masks = torch.stack(simil_masks_list, dim=1)
 
-        extra_data = {"simil_masks": simil_masks, "attn_weights_map": attn_weights_map}
+        extra_data = {"simil_masks": simil_masks}
         return (videos[0], extra_data) if self.rank == 0 else None
