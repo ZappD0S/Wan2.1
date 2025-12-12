@@ -480,7 +480,7 @@ class WanI2V:
                 latent = latent.to(self.device)
 
                 print(timestep)
-                norm_t = timestep / sampling_steps
+                norm_t = timestep / self.num_train_timesteps
                 assert (0.0 <= norm_t) and (norm_t <= 1.0)
                 noise_pred, simil_masks, ts_attn_weights_map = self._compute_noise_pred(
                     [latent],
