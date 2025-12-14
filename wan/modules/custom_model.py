@@ -161,6 +161,8 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
         img_x = flash_attention(q, k_img, v_img, k_lens=None)
+        # this merges heads and channel dims
+        img_x = img_x.flatten(2)
 
         # compute attention
         tokens_data_list = bias_kwargs["tokens_data_list"]
@@ -180,7 +182,6 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
 
             # this merges heads and channel dims
             x = x.flatten(2)
-            img_x = img_x.flatten(2)
 
             x = self.o(x + img_x)
             return x
@@ -189,10 +190,8 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         # TODO: we need to update bias_kwargs to match this code
         if bias_method == "regional_prompting":
             x = flash_attention(q, k, v, k_lens=None)
-
             # this merges heads and channel dims
             x = x.flatten(2)
-            img_x = img_x.flatten(2)
 
             # the head before seq_len is necessary for scaled_dot_product_attention
             q = rearrange(q, "N L H E -> N H L E")
