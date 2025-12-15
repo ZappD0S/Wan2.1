@@ -179,7 +179,6 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
 
         if not bias_kwargs["bias"]:
             x = flash_attention(q, k, v, k_lens=None)
-
             # this merges heads and channel dims
             x = x.flatten(2)
 
