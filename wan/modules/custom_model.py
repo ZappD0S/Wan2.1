@@ -164,7 +164,16 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         # this merges heads and channel dims
         img_x = img_x.flatten(2)
 
-        # compute attention
+        bias_method = bias_kwargs["bias_method"]
+
+        if not bias_kwargs["bias"] or bias_method == "none":
+            x = flash_attention(q, k, v, k_lens=None)
+            # this merges heads and channel dims
+            x = x.flatten(2)
+
+            x = self.o(x + img_x)
+            return x
+
         tokens_data_list = bias_kwargs["tokens_data_list"]
         simil_masks = bias_kwargs["simil_masks"]
         wlw_matrix = bias_kwargs["wlw_matrix"]
@@ -177,16 +186,6 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             wlw_matrix=wlw_matrix,
         )
 
-        if not bias_kwargs["bias"]:
-            x = flash_attention(q, k, v, k_lens=None)
-            # this merges heads and channel dims
-            x = x.flatten(2)
-
-            x = self.o(x + img_x)
-            return x
-
-        bias_method = bias_kwargs["bias_method"]
-        # TODO: we need to update bias_kwargs to match this code
         if bias_method == "regional_prompting":
             x = flash_attention(q, k, v, k_lens=None)
             # this merges heads and channel dims
@@ -197,6 +196,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             k = rearrange(k, "N S H E -> N H S E")
             v = rearrange(v, "N S H E -> N H S E")
 
+            assert attn_mask.dtype == torch.bool
             y = F.scaled_dot_product_attention(
                 query=q, key=k, value=v, attn_mask=attn_mask
             )
@@ -204,6 +204,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             y = rearrange(y, "N H L E -> N L (H E)")
 
             beta = bias_kwargs["beta"]
+            assert (0.0 <= beta) and (beta <= 1.0)
             # NOTE: since self.o is just a linear (no activation function) it doesn't matter if
             # we apply before or after computing this sum
             x = (1 - beta) * x + beta * y
