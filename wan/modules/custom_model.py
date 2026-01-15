@@ -51,7 +51,8 @@ class CustomWanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (T, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        b, s = x.shape[:2]
+        n, d = self.num_heads, self.head_dim
 
         # query, key, value function
         def qkv_fn(x):
@@ -102,7 +103,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         """
 
         def _compute_attn_mask(
-            main_token_mask, descr_token_data_list, simil_masks, wlw_matrix
+            main_token_mask, char_descr_token_data_list, simil_masks, wlw_matrix
         ):
             T, H, W = grid_sizes[0]
             L = T * H * W
@@ -110,18 +111,18 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
                 torch.ones_like(main_token_mask), "S -> 1 L S", L=L
             ).contiguous()
 
-            for tokens_data in descr_token_data_list:
+            for tokens_data in char_descr_token_data_list:
                 inds = tokens_data["inds"]
-                descr_token_masks = tokens_data["descr_token_masks"]
-                gaze_token_mask = tokens_data["gaze_token_mask"]
-                gaze_token_mask = rearrange(gaze_token_mask, "S -> 1 1 S")
+                char_descr_token_masks = tokens_data["char_descr_token_masks"]
+                action_token_mask = tokens_data["action_token_mask"]
+                action_token_mask = rearrange(action_token_mask, "S -> 1 1 S")
 
                 single_ind = len(inds) == 1
 
                 time_mask = wlw_matrix[inds * 2 if single_ind else inds]
                 time_mask = repeat(time_mask, "T -> 1 (T H W) 1", H=H, W=W)
                 attn_mask = torch.where(
-                    gaze_token_mask, attn_mask & time_mask, attn_mask
+                    action_token_mask, attn_mask & time_mask, attn_mask
                 )
 
                 # For now a single index means no interaction.
@@ -131,14 +132,14 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
                     face_mask = simil_masks[:, i]
                     face_mask = rearrange(face_mask, "N L -> N L 1")
                     attn_mask = torch.where(
-                        gaze_token_mask, attn_mask & face_mask, attn_mask
+                        action_token_mask, attn_mask & face_mask, attn_mask
                     )
                     continue
 
-                if not descr_token_masks:
+                if not char_descr_token_masks:
                     raise ValueError
 
-                for i, tokens_mask in zip(inds, descr_token_masks):
+                for i, tokens_mask in zip(inds, char_descr_token_masks):
                     face_mask = simil_masks[:, i]
                     tokens_mask = rearrange(tokens_mask, "S -> 1 1 S")
                     face_mask = rearrange(face_mask, "N L -> N L 1")
@@ -181,7 +182,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
 
         attn_mask = _compute_attn_mask(
             main_token_mask=full_token_mask,
-            descr_token_data_list=tokens_data_list,
+            char_descr_token_data_list=tokens_data_list,
             simil_masks=simil_masks,
             wlw_matrix=wlw_matrix,
         )
@@ -598,15 +599,24 @@ class CustomWanModel(ModelMixin, ConfigMixin):
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        # context
-        context = self.text_embedding(
-            torch.stack(
-                [
-                    torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                    for u in context
-                ]
-            )
-        )
+        def pad(u):
+            return torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+
+        context = self.text_embedding(torch.stack([pad(u) for u in context]))
+
+        full_token_mask = bias_kwargs["full_token_mask"]
+        tokens_data_list = bias_kwargs["tokens_data_list"]
+        tokens_data_list = tokens_data_list.copy()
+
+        full_token_mask = pad(full_token_mask)
+
+        for i, tokens_data in enumerate(tokens_data_list):
+            tokens_data = tokens_data.copy()
+            tokens_data["action_token_mask"] = pad(tokens_data["action_token_mask"])
+            tokens_data["char_descr_token_masks"] = [
+                pad(mask) for mask in tokens_data["char_descr_token_masks"]
+            ]
+        bias_kwargs["tokens_data_list"] = tokens_data_list
 
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 (x2) x dim

@@ -30,7 +30,6 @@ from ..utils.fm_solvers import (
 from ..utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from ..utils.subsequence import get_nested_subsequence_mask
 
-
 NEGATIVE_PROMPT = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 
 
@@ -140,21 +139,21 @@ class WanI2V:
             )
 
             for block in self.model.blocks:
-                block.self_attn.forward = types.MethodType(  # pyright: ignore[reportAttributeAccessIssue]
+                block.self_attn.forward = types.MethodType(  # ty:ignore[invalid-assignment]
                     usp_attn_forward, block.self_attn
                 )
-            self.model.forward = types.MethodType(usp_dit_forward, self.model)
+            self.model.forward = types.MethodType(usp_dit_forward, self.model)  # ty:ignore[invalid-assignment]
             self.sp_size = get_sequence_parallel_world_size()
         else:
             self.sp_size = 1
 
-        if dist.is_initialized():
-            dist.barrier()
+        if dist.is_initialized():  # ty:ignore[possibly-missing-attribute]
+            dist.barrier()  # ty:ignore[possibly-missing-attribute]
         if dit_fsdp:
-            self.model = shard_fn(self.model)  # pyright: ignore[reportAttributeAccessIssue]
+            self.model = shard_fn(self.model)
         else:
             if not init_on_cpu:
-                self.model.to(self.device)  # pyright: ignore[reportArgumentType]
+                self.model.to(self.device)  # ty:ignore[invalid-argument-type]
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
@@ -215,7 +214,9 @@ class WanI2V:
 
         return noise, y, face_masks, max_seq_len
 
-    def _build_context(self, img, prompt, n_prompt, bias_kwargs, offload_model):
+    def _build_context(
+        self, img, prompt_sentences, n_prompt, bias_kwargs, offload_model
+    ):
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
@@ -225,63 +226,83 @@ class WanI2V:
             self.text_encoder.model.to(self.device)
             t5_device = self.device
 
-        context_null = self.text_encoder([n_prompt], t5_device)
-        context = self.text_encoder([prompt], t5_device)
-
-        bias_kwargs = bias_kwargs.copy()
-
-        tokens_data_list = []
         tokenizer = self.text_encoder.tokenizer
 
-        control_prompts = bias_kwargs.pop("control_prompts")
+        context_null = self.text_encoder([n_prompt], t5_device)
 
-        [full_token_ids], [full_token_mask] = tokenizer(
-            prompt, return_mask=True, return_tensors="np"
-        )
-        full_token_mask = torch.from_numpy(full_token_mask).to(
-            dtype=torch.bool, device=self.device
-        )
+        contexts_list = []
+        tokens_data_list = []
 
-        for inds, prompt_data in control_prompts.items():
-            [gaze_token_ids] = tokenizer(  # type: ignore
-                prompt_data["prompt"],
-                padding=False,
-                add_special_tokens=False,
-                return_tensors="np",
+        bias_kwargs = bias_kwargs.copy()
+        control_prompt_lists = bias_kwargs.pop("control_prompt_lists")
+
+        for sentence, control_prompts in zip(prompt_sentences, control_prompt_lists):
+            [sentence_context] = self.text_encoder([sentence], t5_device)
+
+            # TODO: can we directly use return_tensors="pt" here?
+            [full_token_ids], [full_token_mask] = tokenizer(
+                sentence, return_mask=True, add_special_tokens=True, return_tensors="np"
             )
-
-            gaze_token_mask = get_nested_subsequence_mask(
-                full_token_ids, [gaze_token_ids]
-            )
-            gaze_token_mask = torch.from_numpy(gaze_token_mask).to(
+            full_token_mask = torch.from_numpy(full_token_mask).to(
                 dtype=torch.bool, device=self.device
             )
 
-            descr_masks_list = []
-            for descr in prompt_data["descr_list"]:
-                [descr_token_ids] = tokenizer(  # type: ignore
-                    descr,
+            for inds, prompt_data in control_prompts.items():
+                # if the segment is at the end of the sentence, the masks must contain the EOS token
+                add_special_tokens = sentence.endswith(prompt_data["prompt"])
+                [action_token_ids] = tokenizer(
+                    prompt_data["prompt"],
                     padding=False,
-                    add_special_tokens=False,
+                    add_special_tokens=add_special_tokens,
                     return_tensors="np",
                 )
 
-                descr_mask = get_nested_subsequence_mask(
-                    full_token_ids, [gaze_token_ids, descr_token_ids]
+                action_token_mask = get_nested_subsequence_mask(
+                    full_token_ids, [action_token_ids]
                 )
-                descr_mask = torch.from_numpy(descr_mask).to(
+                # prepend array of zeros whose length is total num of previous tokens
+                cum_len = sum(ctx.size(0) for ctx in contexts_list)
+                action_token_mask = np.append(
+                    np.zeros(cum_len, dtype=bool), action_token_mask
+                )
+                action_token_mask = torch.from_numpy(action_token_mask).to(
                     dtype=torch.bool, device=self.device
                 )
-                assert not (descr_mask & (~gaze_token_mask)).any()
-                descr_masks_list.append(descr_mask)
 
-            tokens_data_list.append(
-                {
-                    "inds": inds,
-                    "gaze_token_mask": gaze_token_mask,
-                    "descr_token_masks": descr_masks_list,
-                }
-            )
+                char_descr_masks_list = []
+                for char_descr in prompt_data["char_descr_list"]:
+                    [char_descr_token_ids] = tokenizer(
+                        char_descr,
+                        padding=False,
+                        add_special_tokens=False,
+                        return_tensors="np",
+                    )
+
+                    char_descr_mask = get_nested_subsequence_mask(
+                        full_token_ids, [action_token_ids, char_descr_token_ids]
+                    )
+                    char_descr_mask = torch.from_numpy(char_descr_mask).to(
+                        dtype=torch.bool, device=self.device
+                    )
+                    char_descr_mask = np.append(
+                        np.zeros(cum_len, dtype=bool), char_descr_mask
+                    )
+                    assert not (char_descr_mask & (~action_token_mask)).any()
+                    char_descr_masks_list.append(char_descr_mask)
+
+                tokens_data_list.append(
+                    {
+                        "inds": inds,
+                        "action_token_mask": action_token_mask,
+                        "char_descr_token_masks": char_descr_masks_list,
+                    }
+                )
+
+            contexts_list.append(sentence_context)
+
+        context = [torch.cat(contexts_list).unsqueeze(0)]
+
+        # NOTE: the context and masks that we get here are still unpadded
 
         if self.t5_cpu:
             context = [t.to(self.device) for t in context]
@@ -375,7 +396,7 @@ class WanI2V:
 
     def generate(
         self,
-        prompt,
+        prompt_sentences,
         img,
         bias_kwargs,
         max_area=720 * 1280,
@@ -438,7 +459,7 @@ class WanI2V:
 
         context, context_null, clip_context, bias_kwargs = self._build_context(
             img,
-            prompt,
+            prompt_sentences,
             n_prompt,
             bias_kwargs=bias_kwargs,
             offload_model=offload_model,
@@ -469,7 +490,7 @@ class WanI2V:
 
             simil_masks_list = []
 
-            self.model.to(self.device)  # pyright: ignore[reportArgumentType]
+            self.model.to(self.device)  # ty:ignore[invalid-argument-type]
             for i, t in enumerate(tqdm(timesteps)):
                 bias_timestep = timestep_bias_schedule[i]
 
@@ -523,8 +544,8 @@ class WanI2V:
             gc.collect()
             torch.cuda.synchronize()
 
-        if dist.is_initialized():
-            dist.barrier()
+        if dist.is_initialized():  # ty:ignore[possibly-missing-attribute]
+            dist.barrier()  # ty:ignore[possibly-missing-attribute]
 
         simil_masks = torch.stack(simil_masks_list, dim=1)
 
