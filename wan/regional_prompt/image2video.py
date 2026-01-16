@@ -238,17 +238,23 @@ class WanI2V:
 
         for sentence, control_prompts in zip(prompt_sentences, control_prompt_lists):
             [sentence_context] = self.text_encoder([sentence], t5_device)
+            cum_len = sum(ctx.size(0) for ctx in contexts_list)
 
             # TODO: can we directly use return_tensors="pt" here?
             [full_token_ids], [full_token_mask] = tokenizer(
-                sentence, return_mask=True, add_special_tokens=True, return_tensors="np"
+                sentence,
+                return_mask=True,
+                padding=False,
+                add_special_tokens=True,
+                return_tensors="np",
             )
             full_token_mask = torch.from_numpy(full_token_mask).to(
                 dtype=torch.bool, device=self.device
             )
+            assert sentence_context.size(0) == full_token_mask.size(0)
 
             for inds, prompt_data in control_prompts:
-                # if the segment is at the end of the sentence, the masks must contain the EOS token
+                # if the segment includes the end of the sentence, the masks must contain the EOS token
                 add_special_tokens = sentence.endswith(prompt_data["prompt"])
                 [action_token_ids] = tokenizer(
                     prompt_data["prompt"],
@@ -260,8 +266,7 @@ class WanI2V:
                 action_token_mask = get_nested_subsequence_mask(
                     full_token_ids, [action_token_ids]
                 )
-                # prepend array of zeros whose length is total num of previous tokens
-                cum_len = sum(ctx.size(0) for ctx in contexts_list)
+                # prepend array of zeros whose length is total num of preceding tokens
                 action_token_mask = np.append(
                     np.zeros(cum_len, dtype=bool), action_token_mask
                 )
