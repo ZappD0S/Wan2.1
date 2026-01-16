@@ -247,7 +247,7 @@ class WanI2V:
                 dtype=torch.bool, device=self.device
             )
 
-            for inds, prompt_data in control_prompts.items():
+            for inds, prompt_data in control_prompts:
                 # if the segment is at the end of the sentence, the masks must contain the EOS token
                 add_special_tokens = sentence.endswith(prompt_data["prompt"])
                 [action_token_ids] = tokenizer(
@@ -300,7 +300,7 @@ class WanI2V:
 
             contexts_list.append(sentence_context)
 
-        context = [torch.cat(contexts_list).unsqueeze(0)]
+        context = [torch.cat(contexts_list)]
 
         # NOTE: the context and masks that we get here are still unpadded
 

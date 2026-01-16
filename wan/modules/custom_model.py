@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import gc
 import math
 
 import torch
@@ -599,23 +600,35 @@ class CustomWanModel(ModelMixin, ConfigMixin):
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        def pad(u):
-            return torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+        def pad_to_length(x, dim=-1):
+            pad_len = self.text_len - x.size(dim)
+            assert pad_len >= 0
 
-        context = self.text_embedding(torch.stack([pad(u) for u in context]))
+            offset = abs(dim) if dim < 0 else x.ndim - dim
+            padding = [0] * (2 * offset)
+            padding[-1] = pad_len
+            return F.pad(x, padding)
+
+        context = self.text_embedding(
+            torch.stack([pad_to_length(u, dim=-2) for u in context])
+        )
 
         full_token_mask = bias_kwargs["full_token_mask"]
+        full_token_mask = pad_to_length(full_token_mask)
+        bias_kwargs["full_token_mask"] = full_token_mask
+
         tokens_data_list = bias_kwargs["tokens_data_list"]
+
         tokens_data_list = tokens_data_list.copy()
-
-        full_token_mask = pad(full_token_mask)
-
         for i, tokens_data in enumerate(tokens_data_list):
             tokens_data = tokens_data.copy()
-            tokens_data["action_token_mask"] = pad(tokens_data["action_token_mask"])
+            tokens_data["action_token_mask"] = pad_to_length(
+                tokens_data["action_token_mask"]
+            )
             tokens_data["char_descr_token_masks"] = [
-                pad(mask) for mask in tokens_data["char_descr_token_masks"]
+                pad_to_length(mask) for mask in tokens_data["char_descr_token_masks"]
             ]
+
         bias_kwargs["tokens_data_list"] = tokens_data_list
 
         if clip_fea is not None:
