@@ -617,17 +617,14 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         full_token_mask = pad_to_length(full_token_mask)
         bias_kwargs["full_token_mask"] = full_token_mask
 
-        tokens_data_list = bias_kwargs["tokens_data_list"]
-
-        tokens_data_list = tokens_data_list.copy()
-        for i, tokens_data in enumerate(tokens_data_list):
-            tokens_data = tokens_data.copy()
-            tokens_data["action_token_mask"] = pad_to_length(
-                tokens_data["action_token_mask"]
-            )
-            tokens_data["char_descr_token_masks"] = [
-                pad_to_length(mask) for mask in tokens_data["char_descr_token_masks"]
+        tokens_data_list = []
+        for tokens_data in bias_kwargs["tokens_data_list"]:
+            td = tokens_data.copy()
+            td["action_token_mask"] = pad_to_length(td["action_token_mask"])
+            td["char_descr_token_masks"] = [
+                pad_to_length(mask) for mask in td["char_descr_token_masks"]
             ]
+            tokens_data_list.append(td)
 
         bias_kwargs["tokens_data_list"] = tokens_data_list
 
