@@ -26,6 +26,8 @@ def compute_attn_weights(query, key, chunk_size=512):
 
 
 def compute_simil_masks(query, key, face_masks, chunk_size=512):
+    # TODO: write the output shape of simil_masks
+
     def _weighted_average(x, weights, dim):
         weights = weights / weights.sum(dim=dim, keepdim=True).clamp(min=1e-6)
         return (x * weights).sum(dim=dim)

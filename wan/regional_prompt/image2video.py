@@ -157,8 +157,8 @@ class WanI2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
-    def _build_latents(self, img, face_masks, frame_num, max_area, seed_g):
-        _, h, w = img.shape
+    def _get_lat_h_w(self, size, max_area):
+        h, w = size
         aspect_ratio = h / w
         lat_h = round(
             np.sqrt(max_area * aspect_ratio)
@@ -172,7 +172,27 @@ class WanI2V:
             // self.patch_size[2]
             * self.patch_size[2]
         )
+        return lat_h, lat_w
 
+    def _generate_noise(self, size, max_area, frame_num, seed_g):
+        lat_h, lat_w = self._get_lat_h_w(size, max_area)
+
+        r = self.vae_stride[0]
+        noise = torch.randn(
+            16,
+            (frame_num + r - 1) // r,
+            lat_h,
+            lat_w,
+            dtype=torch.float32,
+            generator=seed_g,
+            device=self.device,
+        )
+        return noise
+
+    def _build_latents(self, img, face_masks, frame_num, max_area):
+        lat_h, lat_w = self._get_lat_h_w(img.size, max_area)
+
+        # TODO: use rearrange here so we also see what's the shape
         face_masks = face_masks.float().unsqueeze(1)
         face_masks = F.interpolate(face_masks, size=(lat_h, lat_w), mode='nearest')
         face_masks = face_masks.squeeze(1).bool()
@@ -188,16 +208,7 @@ class WanI2V:
         )
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
-        r = 4
-        noise = torch.randn(
-            16,
-            (frame_num + r - 1) // r,
-            lat_h,
-            lat_w,
-            dtype=torch.float32,
-            generator=seed_g,
-            device=self.device,
-        )
+        r = self.vae_stride[0]
 
         padding_frames = torch.zeros(3, frame_num - 1, h, w)
         resized_img = F.interpolate(img.unsqueeze(0).cpu(), size=(h, w), mode="bicubic")
@@ -212,7 +223,7 @@ class WanI2V:
         msk[:, 0] = 1
         y = torch.concat([msk, y])
 
-        return noise, y, face_masks, max_seq_len
+        return y, face_masks, max_seq_len
 
     def _build_context(
         self, img, prompt_sentences, n_prompt, bias_kwargs, offload_model
@@ -399,6 +410,142 @@ class WanI2V:
 
         return noise_pred, simil_masks
 
+    def generate_from_latents(
+        self,
+        img,
+        prompt_sentences,
+        bias_kwargs,
+        latent,
+        t_i=None,
+        max_area=720 * 1280,
+        frame_num=81,
+        shift=5.0,
+        sample_solver='unipc',
+        sampling_steps=40,
+        guide_scale=5.0,
+        n_prompt=NEGATIVE_PROMPT,
+        seed: int | torch.Generator = -1,
+        offload_model=True,
+    ):
+        sample_scheduler, timesteps = self._get_scheduler(
+            sample_solver, sampling_steps, shift
+        )
+
+        if t_i is None:
+            i0 = 0
+        else:
+            mask = timesteps == t_i
+
+            if not mask.any():
+                raise ValueError
+
+            idx = mask.nonzero(as_tuple=True)
+
+            if len(idx[0]) != 1:
+                raise ValueError(f"Expected exactly one match, found {len(idx[0])}")
+
+            i0 = idx[0][0].item()
+
+        if isinstance(seed, int):
+            seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
+            seed_g = torch.Generator(device=self.device)
+            seed_g.manual_seed(seed)
+        elif isinstance(seed, torch.Generator):
+            seed_g = seed
+        else:
+            raise ValueError
+
+        timestep_bias_schedule = bias_kwargs.pop("timestep_bias_schedule")
+
+        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+
+        bias_kwargs = bias_kwargs.copy()
+        y, bias_kwargs["face_masks"], max_seq_len = self._build_latents(
+            img, bias_kwargs["face_masks"], frame_num, max_area
+        )
+        context, context_null, clip_context, bias_kwargs = self._build_context(
+            img,
+            prompt_sentences,
+            n_prompt,
+            bias_kwargs=bias_kwargs,
+            offload_model=offload_model,
+        )
+
+        @contextmanager
+        def noop_no_sync():
+            yield
+
+        no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+
+        with (
+            torch.autocast("cuda", dtype=self.param_dtype),
+            torch.no_grad(),
+            no_sync(),
+        ):
+            if offload_model:
+                torch.cuda.empty_cache()
+
+            simil_masks_list = []
+            for i, t in enumerate(tqdm(timesteps[i0:])):
+                bias_timestep = timestep_bias_schedule[i + i0]
+
+                timestep = torch.tensor([t], device=self.device)
+                latent = latent.to(self.device)
+
+                norm_t = timestep / self.num_train_timesteps
+                assert (0.0 <= norm_t) and (norm_t <= 1.0)
+                noise_pred, simil_masks = self._compute_noise_pred(
+                    [latent],
+                    timestep,
+                    [y],
+                    context=context,
+                    context_null=context_null,
+                    clip_context=clip_context,
+                    bias_kwargs=bias_kwargs
+                    | {"normalized_timestep": norm_t, "bias": bias_timestep},
+                    max_seq_len=max_seq_len,
+                    guide_scale=guide_scale,
+                    offload_model=offload_model,
+                )
+
+                latent = latent.to(
+                    torch.device('cpu') if offload_model else self.device
+                )
+
+                simil_masks = simil_masks.to("cpu")
+                simil_masks_list.append(simil_masks)
+
+                temp_x0 = sample_scheduler.step(
+                    noise_pred.unsqueeze(0),
+                    t,
+                    latent.unsqueeze(0),
+                    return_dict=False,
+                    generator=seed_g,
+                )[0]
+                latent = temp_x0.squeeze(0)
+
+            if offload_model:
+                self.model.cpu()
+                torch.cuda.empty_cache()
+
+            videos = [None]
+            if self.rank == 0:
+                videos = self.vae.decode([latent.to(self.device)])
+
+        del latent, temp_x0
+
+        if offload_model:
+            gc.collect()
+            torch.cuda.synchronize()
+
+        if dist.is_initialized():  # ty:ignore[possibly-missing-attribute]
+            dist.barrier()  # ty:ignore[possibly-missing-attribute]
+
+        simil_masks = torch.stack(simil_masks_list, dim=1)
+
+        extra_data = {"simil_masks": simil_masks}
+        return (videos[0], extra_data) if self.rank == 0 else None
+
     def generate(
         self,
         prompt_sentences,
@@ -450,109 +597,25 @@ class WanI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
-        bias_kwargs = bias_kwargs.copy()
+        noise = self._generate_noise(img.size, max_area, frame_num, seed_g)
 
-        noise, y, bias_kwargs["face_masks"], max_seq_len = self._build_latents(
-            img, bias_kwargs["face_masks"], frame_num, max_area, seed_g
-        )
-
-        context, context_null, clip_context, bias_kwargs = self._build_context(
+        return self.generate_from_latents(
             img,
             prompt_sentences,
-            n_prompt,
-            bias_kwargs=bias_kwargs,
+            bias_kwargs,
+            noise,
+            max_area=max_area,
+            frame_num=frame_num,
+            shift=shift,
+            sample_solver=sample_solver,
+            sampling_steps=sampling_steps,
+            guide_scale=guide_scale,
+            n_prompt=n_prompt,
+            seed=seed_g,
             offload_model=offload_model,
         )
-
-        @contextmanager
-        def noop_no_sync():
-            yield
-
-        no_sync = getattr(self.model, 'no_sync', noop_no_sync)
-
-        # evaluation mode
-        with (
-            torch.autocast("cuda", dtype=self.param_dtype),
-            torch.no_grad(),
-            no_sync(),
-        ):
-            sample_scheduler, timesteps = self._get_scheduler(
-                sample_solver, sampling_steps, shift
-            )
-            # sample videos
-            latent = noise
-
-            if offload_model:
-                torch.cuda.empty_cache()
-
-            timestep_bias_schedule = bias_kwargs.pop("timestep_bias_schedule")
-
-            simil_masks_list = []
-
-            self.model.to(self.device)  # ty:ignore[invalid-argument-type]
-            for i, t in enumerate(tqdm(timesteps)):
-                bias_timestep = timestep_bias_schedule[i]
-
-                timestep = torch.tensor([t], device=self.device)
-                latent = latent.to(self.device)
-
-                norm_t = timestep / self.num_train_timesteps
-                assert (0.0 <= norm_t) and (norm_t <= 1.0)
-                noise_pred, simil_masks = self._compute_noise_pred(
-                    [latent],
-                    timestep,
-                    [y],
-                    context=context,
-                    context_null=context_null,
-                    clip_context=clip_context,
-                    bias_kwargs=bias_kwargs
-                    | {"normalized_timestep": norm_t, "bias": bias_timestep},
-                    max_seq_len=max_seq_len,
-                    guide_scale=guide_scale,
-                    offload_model=offload_model,
-                )
-
-                latent = latent.to(
-                    torch.device('cpu') if offload_model else self.device
-                )
-
-                simil_masks = simil_masks.to("cpu")
-                simil_masks_list.append(simil_masks)
-
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latent.unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g,
-                )[0]
-                latent = temp_x0.squeeze(0)
-
-            if offload_model:
-                self.model.cpu()
-                torch.cuda.empty_cache()
-
-            videos = [None]
-            if self.rank == 0:
-                videos = self.vae.decode([latent.to(self.device)])
-
-        del noise, latent
-        del sample_scheduler
-
-        if offload_model:
-            gc.collect()
-            torch.cuda.synchronize()
-
-        if dist.is_initialized():  # ty:ignore[possibly-missing-attribute]
-            dist.barrier()  # ty:ignore[possibly-missing-attribute]
-
-        simil_masks = torch.stack(simil_masks_list, dim=1)
-
-        extra_data = {"simil_masks": simil_masks}
-        return (videos[0], extra_data) if self.rank == 0 else None
