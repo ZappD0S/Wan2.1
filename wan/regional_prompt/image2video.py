@@ -238,10 +238,10 @@ class WanI2V:
             t5_device = self.device
 
         tokenizer = self.text_encoder.tokenizer
-
         context_null = self.text_encoder([n_prompt], t5_device)
 
         contexts_list = []
+        full_token_masks_list = []
         tokens_data_list = []
 
         bias_kwargs = bias_kwargs.copy()
@@ -251,21 +251,18 @@ class WanI2V:
             [sentence_context] = self.text_encoder([sentence], t5_device)
             cum_len = sum(ctx.size(0) for ctx in contexts_list)
 
-            # TODO: can we directly use return_tensors="pt" here?
-            [full_token_ids], [full_token_mask] = tokenizer(
+            [full_token_ids], [full_token_mask_np] = tokenizer(
                 sentence,
                 return_mask=True,
                 padding=False,
                 add_special_tokens=True,
                 return_tensors="np",
             )
-            full_token_mask = torch.from_numpy(full_token_mask).to(
+            full_token_mask = torch.from_numpy(full_token_mask_np).to(
                 dtype=torch.bool, device=self.device
             )
-            assert sentence_context.size(0) == full_token_mask.size(0)
 
             for inds, prompt_data in control_prompts:
-                # if the segment includes the end of the sentence, the masks must contain the EOS token
                 add_special_tokens = sentence.endswith(prompt_data["prompt"])
                 [action_token_ids] = tokenizer(
                     prompt_data["prompt"],
@@ -274,14 +271,13 @@ class WanI2V:
                     return_tensors="np",
                 )
 
-                action_token_mask = get_nested_subsequence_mask(
+                action_token_mask_np = get_nested_subsequence_mask(
                     full_token_ids, [action_token_ids]
                 )
-                # prepend array of zeros whose length is total num of preceding tokens
-                action_token_mask = np.append(
-                    np.zeros(cum_len, dtype=bool), action_token_mask
+                action_token_mask_np = np.append(
+                    np.zeros(cum_len, dtype=bool), action_token_mask_np
                 )
-                action_token_mask = torch.from_numpy(action_token_mask).to(
+                action_token_mask = torch.from_numpy(action_token_mask_np).to(
                     dtype=torch.bool, device=self.device
                 )
 
@@ -294,15 +290,16 @@ class WanI2V:
                         return_tensors="np",
                     )
 
-                    char_descr_mask = get_nested_subsequence_mask(
+                    char_descr_mask_np = get_nested_subsequence_mask(
                         full_token_ids, [action_token_ids, char_descr_token_ids]
                     )
-                    char_descr_mask = torch.from_numpy(char_descr_mask).to(
+                    char_descr_mask_np = np.append(
+                        np.zeros(cum_len, dtype=bool), char_descr_mask_np
+                    )
+                    char_descr_mask = torch.from_numpy(char_descr_mask_np).to(
                         dtype=torch.bool, device=self.device
                     )
-                    char_descr_mask = np.append(
-                        np.zeros(cum_len, dtype=bool), char_descr_mask
-                    )
+
                     assert not (char_descr_mask & (~action_token_mask)).any()
                     char_descr_masks_list.append(char_descr_mask)
 
@@ -315,14 +312,16 @@ class WanI2V:
                 )
 
             contexts_list.append(sentence_context)
+            full_token_masks_list.append(full_token_mask)
 
         context = [torch.cat(contexts_list)]
-
-        # NOTE: the context and masks that we get here are still unpadded
+        full_token_mask = torch.cat(full_token_masks_list)
 
         if self.t5_cpu:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
+        elif offload_model:
+            self.text_encoder.model.cpu()
 
         self.clip.model.to(self.device)
         clip_context = self.clip.visual([img[:, None, :, :]])
