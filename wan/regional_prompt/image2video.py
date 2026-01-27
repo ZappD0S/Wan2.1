@@ -192,7 +192,8 @@ class WanI2V:
         return noise
 
     def _build_latents(self, img, face_masks, frame_num, max_area):
-        lat_h, lat_w = self._get_lat_h_w(img.shape[:2], max_area)
+        _, h, w = img.shape
+        lat_h, lat_w = self._get_lat_h_w((h, w), max_area)
 
         # TODO: use rearrange here so we also see what's the shape
         face_masks = face_masks.float().unsqueeze(1)
@@ -202,15 +203,14 @@ class WanI2V:
         h = lat_h * self.vae_stride[1]
         w = lat_w * self.vae_stride[2]
 
+        r = self.vae_stride[0]
         max_seq_len = (
-            ((frame_num - 1) // self.vae_stride[0] + 1)
+            ((frame_num - 1) // r + 1)
             * lat_h
             * lat_w
             // (self.patch_size[1] * self.patch_size[2])
         )
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
-
-        r = self.vae_stride[0]
 
         padding_frames = torch.zeros(3, frame_num - 1, h, w)
         resized_img = F.interpolate(img.unsqueeze(0).cpu(), size=(h, w), mode="bicubic")
@@ -486,6 +486,7 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
+            self.model.to(self.device)
             simil_masks_list = []
             for i, t in enumerate(tqdm(timesteps[i0:])):
                 bias_timestep = timestep_bias_schedule[i + i0]
@@ -603,7 +604,8 @@ class WanI2V:
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
-        noise = self._generate_noise(img.size, max_area, frame_num, seed_g)
+        w, h = img.size
+        noise = self._generate_noise((h, w), max_area, frame_num, seed_g)
 
         return self.generate_from_latents(
             img,
