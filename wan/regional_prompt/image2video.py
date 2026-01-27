@@ -160,6 +160,8 @@ class WanI2V:
     def _get_lat_h_w(self, size, max_area):
         h, w = size
         aspect_ratio = h / w
+        assert aspect_ratio <= 1
+
         lat_h = round(
             np.sqrt(max_area * aspect_ratio)
             // self.vae_stride[1]
@@ -190,7 +192,7 @@ class WanI2V:
         return noise
 
     def _build_latents(self, img, face_masks, frame_num, max_area):
-        lat_h, lat_w = self._get_lat_h_w(img.size, max_area)
+        lat_h, lat_w = self._get_lat_h_w(img.shape[:2], max_area)
 
         # TODO: use rearrange here so we also see what's the shape
         face_masks = face_masks.float().unsqueeze(1)
