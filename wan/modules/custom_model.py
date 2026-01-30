@@ -104,7 +104,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         """
 
         def _compute_attn_mask(
-            main_token_mask, char_descr_token_data_list, simil_masks, wlw_matrix
+            main_token_mask, token_data_list, simil_masks, wlw_matrix
         ):
             T, H, W = grid_sizes[0]
             L = T * H * W
@@ -112,7 +112,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
                 torch.ones_like(main_token_mask), "S -> 1 L S", L=L
             ).contiguous()
 
-            for tokens_data in char_descr_token_data_list:
+            for tokens_data in token_data_list:
                 inds = tokens_data["inds"]
                 char_descr_token_masks = tokens_data["char_descr_token_masks"]
                 action_token_mask = tokens_data["action_token_mask"]
@@ -183,7 +183,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
 
         attn_mask = _compute_attn_mask(
             main_token_mask=full_token_mask,
-            char_descr_token_data_list=tokens_data_list,
+            token_data_list=tokens_data_list,
             simil_masks=simil_masks,
             wlw_matrix=wlw_matrix,
         )
