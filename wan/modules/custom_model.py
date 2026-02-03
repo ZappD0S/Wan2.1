@@ -130,51 +130,80 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
                 # It's just for a piece of text that concern a single character.
                 if single_ind:
                     (i,) = inds
-                    face_mask = simil_masks[:, i]
-                    face_mask = rearrange(face_mask, "N L -> N L 1")
+                    simil_mask = simil_masks[:, i]
+                    simil_mask = rearrange(simil_mask, "N L -> N L 1")
                     attn_mask = torch.where(
-                        action_token_mask, attn_mask & face_mask, attn_mask
+                        action_token_mask, attn_mask & simil_mask, attn_mask
                     )
                     continue
 
                 if not char_descr_token_masks:
                     raise ValueError
 
-                for i, tokens_mask in zip(inds, char_descr_token_masks):
-                    face_mask = simil_masks[:, i]
+                for i, tokens_mask in zip(inds, char_descr_token_masks, strict=True):
+                    simil_mask = simil_masks[:, i]
                     tokens_mask = rearrange(tokens_mask, "S -> 1 1 S")
-                    face_mask = rearrange(face_mask, "N L -> N L 1")
+                    simil_mask = rearrange(simil_mask, "N L -> N L 1")
                     attn_mask = torch.where(
-                        tokens_mask, attn_mask & face_mask, attn_mask
+                        tokens_mask, attn_mask & simil_mask, attn_mask
                     )
 
             return attn_mask
 
+        def _compute_attn(x, context, context_img):
+            b, n, d = x.size(0), self.num_heads, self.head_dim
+            q = self.norm_q(self.q(x)).view(b, -1, n, d)
+            k = self.norm_k(self.k(context)).view(b, -1, n, d)
+            v = self.v(context).view(b, -1, n, d)
+            x = flash_attention(q, k, v, k_lens=None)
+            x = x.flatten(2)
+
+            k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+            v_img = self.v_img(context_img).view(b, -1, n, d)
+            img_x = flash_attention(q, k_img, v_img, k_lens=None)
+            # this merges heads and channel dims
+            img_x = img_x.flatten(2)
+
+            x = self.o(x + img_x)
+            return x
+
         image_context_length = context.shape[1] - T5_CONTEXT_TOKEN_NUMBER
         context_img = context[:, :image_context_length]
         context = context[:, image_context_length:]
-        b, n, d = x.size(0), self.num_heads, self.head_dim
-
-        # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-
-        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-        v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = flash_attention(q, k_img, v_img, k_lens=None)
-        # this merges heads and channel dims
-        img_x = img_x.flatten(2)
 
         bias_method = bias_kwargs["bias_method"]
 
         if not bias_kwargs["bias"] or bias_method == "none":
-            x = flash_attention(q, k, v, k_lens=None)
-            # this merges heads and channel dims
-            x = x.flatten(2)
+            return _compute_attn(x, context, context_img)
 
-            x = self.o(x + img_x)
-            return x
+        # we don't need to compute the attention mask, so I would leave this branch here
+        if bias_method == "concept_weaver":
+            full_contexts = bias_kwargs["full_contexts"]
+            simil_masks = bias_kwargs["simil_masks"]
+            general_prompt_ctx = bias_kwargs["general_prompt_context"]
+            if general_prompt_ctx is None:
+                raise ValueError
+
+            # the attn_out here is the one that we use for the background
+            attn_out = _compute_attn(
+                x,
+                general_prompt_ctx,
+                context_img,  # here we just use the regular img context with both characters
+            )
+
+            for simil_mask, full_ctx in zip(
+                simil_masks.unbind(dim=1), full_contexts, strict=True
+            ):
+                ctx_img = full_ctx[:, :image_context_length]
+                sentence_ctx = full_ctx[:, image_context_length:]
+
+                # the shape is N L C (N is one, C is channel and is not important)
+                prompt_attn_out = _compute_attn(x, sentence_ctx, ctx_img)
+                attn_out = torch.where(
+                    simil_mask.unsqueeze(-1), prompt_attn_out, attn_out
+                )
+
+            return attn_out
 
         tokens_data_list = bias_kwargs["tokens_data_list"]
         simil_masks = bias_kwargs["simil_masks"]
@@ -187,6 +216,11 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             simil_masks=simil_masks,
             wlw_matrix=wlw_matrix,
         )
+
+        b, n, d = x.size(0), self.num_heads, self.head_dim
+        q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        k = self.norm_k(self.k(context)).view(b, -1, n, d)
+        v = self.v(context).view(b, -1, n, d)
 
         if bias_method == "regional_prompting":
             x = flash_attention(q, k, v, k_lens=None)
@@ -228,6 +262,12 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             x = rearrange(x, "N H L E -> N L (H E)")
         else:
             raise ValueError("Unknown bias method!")
+
+        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+        v_img = self.v_img(context_img).view(b, -1, n, d)
+        img_x = flash_attention(q, k_img, v_img, k_lens=None)
+        # this merges heads and channel dims
+        img_x = img_x.flatten(2)
 
         x = self.o(x + img_x)
 
@@ -527,7 +567,7 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
-    def forward(self, x, t, context, seq_len, bias_kwargs, clip_fea=None, y=None):
+    def forward(self, x, t, context, seq_len, bias_kwargs, clip_fea, y):
         r"""
         Forward pass through the diffusion model
 
@@ -557,7 +597,7 @@ class CustomWanModel(ModelMixin, ConfigMixin):
             self.freqs = self.freqs.to(device)
 
         if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y, strict=True)]
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -609,13 +649,53 @@ class CustomWanModel(ModelMixin, ConfigMixin):
             padding[-1] = pad_len
             return F.pad(x, padding)
 
+        # TODO: instead of doing stack on a singleton list, can we remove the list and do unsqueeze?
         context = self.text_embedding(
             torch.stack([pad_to_length(u, dim=-2) for u in context])
         )
 
+        context_clip = self.img_emb(clip_fea)  # bs x 257 (x2) x dim
+        context = torch.concat([context_clip, context], dim=1)
+
         full_token_mask = bias_kwargs["full_token_mask"]
         full_token_mask = pad_to_length(full_token_mask)
         bias_kwargs["full_token_mask"] = full_token_mask
+
+        sentence_contexts = bias_kwargs["sentence_contexts"]
+        single_char_img_contexts = bias_kwargs.pop("single_char_img_contexts")
+
+        if not single_char_img_contexts:
+            single_char_img_contexts = [None] * len(sentence_contexts)
+
+        full_contexts = []
+        for sentence_ctx, single_char_img_ctx in zip(
+            sentence_contexts, single_char_img_contexts, strict=True
+        ):
+            sentence_ctx = self.text_embedding(pad_to_length(sentence_ctx, dim=-2))
+            single_char_img_ctx = self.img_emb(single_char_img_ctx)
+
+            ctx = torch.concat(
+                [
+                    single_char_img_ctx
+                    if single_char_img_ctx is not None
+                    else context_clip,
+                    sentence_ctx,
+                ]
+            )
+            full_contexts.append(ctx.unsqueeze(0))
+
+        bias_kwargs["full_contexts"] = full_contexts
+
+        general_prompt_context = bias_kwargs["general_prompt_context"]
+
+        if general_prompt_context:
+            general_prompt_context = self.text_embedding(
+                torch.stack([pad_to_length(u, dim=-2) for u in general_prompt_context])
+            )
+        else:
+            general_prompt_context = None
+
+        bias_kwargs["general_prompt_context"] = general_prompt_context
 
         tokens_data_list = []
         for tokens_data in bias_kwargs["tokens_data_list"]:
@@ -627,10 +707,6 @@ class CustomWanModel(ModelMixin, ConfigMixin):
             tokens_data_list.append(td)
 
         bias_kwargs["tokens_data_list"] = tokens_data_list
-
-        if clip_fea is not None:
-            context_clip = self.img_emb(clip_fea)  # bs x 257 (x2) x dim
-            context = torch.concat([context_clip, context], dim=1)
 
         # arguments
         shared_kwargs = dict(
@@ -687,7 +763,7 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         p, q, r = self.patch_size
         out = []
 
-        for u, v in zip(x, grid_sizes.tolist()):
+        for u, v in zip(x, grid_sizes.tolist(), strict=True):
             u = u[: math.prod(v)]
             f, h, w = v
             u = rearrange(

@@ -8,6 +8,7 @@ import sys
 import types
 from contextlib import contextmanager
 from functools import partial
+from typing import Any, TypedDict
 
 import numpy as np
 import torch
@@ -15,6 +16,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from einops import rearrange
+from PIL import Image
 from tqdm import tqdm
 
 from ..distributed.fsdp import shard_model
@@ -33,19 +35,9 @@ from ..utils.subsequence import get_nested_subsequence_mask
 NEGATIVE_PROMPT = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 
 
-def find_subsequence(seq, subseq):
-    seq_len = len(seq)
-    subseq_len = len(subseq)
-
-    if subseq_len > seq_len:
-        return -1
-
-    for i in range(seq_len - subseq_len + 1):
-        window = seq[i : i + subseq_len]
-        if window == subseq:
-            return i
-
-    return -1
+class SentenceData(TypedDict):
+    prompt: str
+    image: Image.Image | None
 
 
 class WanI2V:
@@ -157,7 +149,10 @@ class WanI2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
-    def _get_lat_h_w(self, size, max_area):
+    def _img_to_tensor(self, img: Image.Image) -> torch.Tensor:
+        return TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+
+    def _get_lat_h_w(self, size: tuple[int, int], max_area: float):
         h, w = size
         aspect_ratio = h / w
         assert aspect_ratio <= 1
@@ -176,7 +171,13 @@ class WanI2V:
         )
         return lat_h, lat_w
 
-    def _generate_noise(self, size, max_area, frame_num, seed_g):
+    def _generate_noise(
+        self,
+        size: tuple[int, int],
+        max_area: float,
+        frame_num: int,
+        seed_g: torch.Generator,
+    ):
         lat_h, lat_w = self._get_lat_h_w(size, max_area)
 
         r = self.vae_stride[0]
@@ -191,8 +192,14 @@ class WanI2V:
         )
         return noise
 
-    def _build_latents(self, img, face_masks, frame_num, max_area):
-        _, h, w = img.shape
+    def _build_latents(
+        self,
+        img_tensor: torch.Tensor,
+        face_masks: torch.Tensor,
+        frame_num: int,
+        max_area,
+    ):
+        _, h, w = img_tensor.shape
         lat_h, lat_w = self._get_lat_h_w((h, w), max_area)
 
         # TODO: use rearrange here so we also see what's the shape
@@ -213,7 +220,9 @@ class WanI2V:
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
         padding_frames = torch.zeros(3, frame_num - 1, h, w)
-        resized_img = F.interpolate(img.unsqueeze(0).cpu(), size=(h, w), mode="bicubic")
+        resized_img = F.interpolate(
+            img_tensor.unsqueeze(0).cpu(), size=(h, w), mode="bicubic"
+        )
         resized_img = rearrange(resized_img, "1 C H W -> C 1 H W")
 
         input_sequence = torch.concat([resized_img, padding_frames], dim=1)
@@ -228,7 +237,12 @@ class WanI2V:
         return y, face_masks, max_seq_len
 
     def _build_context(
-        self, img, prompt_sentences, n_prompt, bias_kwargs, offload_model
+        self,
+        img_tensor: torch.Tensor,
+        prompt_sentences: list[str],
+        n_prompt: str,
+        bias_kwargs,
+        offload_model: bool,
     ):
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
@@ -239,19 +253,41 @@ class WanI2V:
             self.text_encoder.model.to(self.device)
             t5_device = self.device
 
+        self.clip.model.to(self.device)
+
         tokenizer = self.text_encoder.tokenizer
         context_null = self.text_encoder([n_prompt], t5_device)
 
-        contexts_list = []
+        sentence_contexts = []
+        single_char_img_contexts = []
+
         full_token_masks_list = []
         tokens_data_list = []
 
         bias_kwargs = bias_kwargs.copy()
-        control_prompt_lists = bias_kwargs.pop("control_prompt_lists")
+        prompt_data_list = bias_kwargs.pop("prompt_data_list")
+        general_prompt = bias_kwargs.pop("general_prompt")
 
-        for sentence, control_prompts in zip(prompt_sentences, control_prompt_lists):
+        if general_prompt is not None:
+            general_prompt_context = self.text_encoder([general_prompt], t5_device)
+        else:
+            general_prompt_context = []
+
+        for sentence, prompt_data in zip(
+            prompt_sentences, prompt_data_list, strict=True
+        ):
+            control_prompts = prompt_data["control_prompts"]
             [sentence_context] = self.text_encoder([sentence], t5_device)
-            cum_len = sum(ctx.size(0) for ctx in contexts_list)
+            single_char_img = prompt_data["single_char_img"]
+
+            if single_char_img is not None:
+                single_char_img_tensor = self._img_to_tensor(single_char_img)
+                [single_char_img_context] = self.clip.visual(
+                    [single_char_img_tensor[:, None, :, :]]
+                )
+                single_char_img_contexts.append(single_char_img_context)
+
+            cum_len = sum(ctx.size(0) for ctx in sentence_contexts)
 
             [full_token_ids], [full_token_mask_np] = tokenizer(
                 sentence,
@@ -293,7 +329,8 @@ class WanI2V:
                     )
 
                     char_descr_mask_np = get_nested_subsequence_mask(
-                        full_token_ids, [action_token_ids, char_descr_token_ids]
+                        full_token_ids,
+                        [action_token_ids, char_descr_token_ids],
                     )
                     char_descr_mask_np = np.append(
                         np.zeros(cum_len, dtype=bool), char_descr_mask_np
@@ -313,25 +350,35 @@ class WanI2V:
                     }
                 )
 
-            contexts_list.append(sentence_context)
+            sentence_contexts.append(sentence_context)
             full_token_masks_list.append(full_token_mask)
 
-        context = [torch.cat(contexts_list)]
+        context = [torch.cat(sentence_contexts)]
         full_token_mask = torch.cat(full_token_masks_list)
 
         if self.t5_cpu:
+            general_prompt_context = [t.to(self.device) for t in general_prompt_context]
+            sentence_contexts = [t.to(self.device) for t in sentence_contexts]
+            single_char_img_contexts = [
+                t.to(self.device) for t in single_char_img_contexts
+            ]
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
         elif offload_model:
             self.text_encoder.model.cpu()
 
-        self.clip.model.to(self.device)
-        clip_context = self.clip.visual([img[:, None, :, :]])
+        clip_context = self.clip.visual([img_tensor[:, None, :, :]])
 
         if offload_model:
             self.clip.model.cpu()
             torch.cuda.empty_cache()
 
+        assert len(single_char_img_contexts) == 0 or len(
+            single_char_img_contexts
+        ) == len(sentence_contexts)
+        bias_kwargs["general_prompt_context"] = general_prompt_context
+        bias_kwargs["sentence_contexts"] = sentence_contexts
+        bias_kwargs["single_char_img_contexts"] = single_char_img_contexts
         bias_kwargs["tokens_data_list"] = tokens_data_list
         bias_kwargs["full_token_mask"] = full_token_mask
 
@@ -413,8 +460,8 @@ class WanI2V:
 
     def generate_from_latents(
         self,
-        img,
-        prompt_sentences,
+        img: Image.Image,
+        prompt_sentences: list[str],
         bias_kwargs,
         latent,
         t_i=None,
@@ -458,14 +505,13 @@ class WanI2V:
 
         timestep_bias_schedule = bias_kwargs.pop("timestep_bias_schedule")
 
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
-
         bias_kwargs = bias_kwargs.copy()
+        img_tensor = self._img_to_tensor(img)
         y, bias_kwargs["face_masks"], max_seq_len = self._build_latents(
-            img, bias_kwargs["face_masks"], frame_num, max_area
+            img_tensor, bias_kwargs["face_masks"], frame_num, max_area
         )
         context, context_null, clip_context, bias_kwargs = self._build_context(
-            img,
+            img_tensor,
             prompt_sentences,
             n_prompt,
             bias_kwargs=bias_kwargs,
@@ -486,7 +532,7 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
-            self.model.to(self.device)
+            self.model.to(self.device)  # ty:ignore[invalid-argument-type]
             simil_masks_list = []
             for i, t in enumerate(tqdm(timesteps[i0:])):
                 bias_timestep = timestep_bias_schedule[i + i0]
@@ -548,10 +594,13 @@ class WanI2V:
         extra_data = {"simil_masks": simil_masks}
         return (videos[0], extra_data) if self.rank == 0 else None
 
+    # NOTE:
+    # - the single char images are optional,
+    # - the general_prompt is optional. -> what if we make it mandatory?
     def generate(
         self,
-        prompt_sentences,
-        img,
+        prompt_sentences: list[str],
+        img: Image.Image,
         bias_kwargs,
         max_area=720 * 1280,
         frame_num=81,
