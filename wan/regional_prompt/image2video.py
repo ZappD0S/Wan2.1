@@ -35,11 +35,6 @@ from ..utils.subsequence import get_nested_subsequence_mask
 NEGATIVE_PROMPT = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 
 
-class SentenceData(TypedDict):
-    prompt: str
-    image: Image.Image | None
-
-
 class WanI2V:
     def __init__(
         self,
@@ -195,17 +190,11 @@ class WanI2V:
     def _build_latents(
         self,
         img_tensor: torch.Tensor,
-        face_masks: torch.Tensor,
         frame_num: int,
         max_area,
     ):
         _, h, w = img_tensor.shape
         lat_h, lat_w = self._get_lat_h_w((h, w), max_area)
-
-        # TODO: use rearrange here so we also see what's the shape
-        face_masks = face_masks.float().unsqueeze(1)
-        face_masks = F.interpolate(face_masks, size=(lat_h, lat_w), mode='nearest')
-        face_masks = face_masks.squeeze(1).bool()
 
         h = lat_h * self.vae_stride[1]
         w = lat_w * self.vae_stride[2]
@@ -234,7 +223,7 @@ class WanI2V:
         msk[:, 0] = 1
         y = torch.concat([msk, y])
 
-        return y, face_masks, max_seq_len
+        return y, max_seq_len
 
     def _build_context(
         self,
@@ -435,10 +424,11 @@ class WanI2V:
         cond_kwargs["bias_kwargs"] = bias_kwargs
 
         [noise_pred_cond], simil_masks = self.model(latent, **cond_kwargs)
+        assert "simil_masks" not in bias_kwargs
 
         if offload_model:
             noise_pred_cond = noise_pred_cond.to('cpu')
-            simil_masks.to('cpu')
+            simil_masks = simil_masks.to('cpu')
 
             torch.cuda.empty_cache()
 
@@ -507,9 +497,7 @@ class WanI2V:
 
         bias_kwargs = bias_kwargs.copy()
         img_tensor = self._img_to_tensor(img)
-        y, bias_kwargs["face_masks"], max_seq_len = self._build_latents(
-            img_tensor, bias_kwargs["face_masks"], frame_num, max_area
-        )
+        y, max_seq_len = self._build_latents(img_tensor, frame_num, max_area)
         context, context_null, clip_context, bias_kwargs = self._build_context(
             img_tensor,
             prompt_sentences,
@@ -523,6 +511,7 @@ class WanI2V:
             yield
 
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+        temp_x0 = None
 
         with (
             torch.autocast("cuda", dtype=self.param_dtype),
@@ -594,9 +583,6 @@ class WanI2V:
         extra_data = {"simil_masks": simil_masks}
         return (videos[0], extra_data) if self.rank == 0 else None
 
-    # NOTE:
-    # - the single char images are optional,
-    # - the general_prompt is optional. -> what if we make it mandatory?
     def generate(
         self,
         prompt_sentences: list[str],
