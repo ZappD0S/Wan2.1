@@ -31,6 +31,8 @@ def _flex_attention_compiled(q, k, v, block_mask):
     return flex_attention(q, k, v, block_mask=block_mask)
 
 
+# TODO: we have to make the masked self attention optional, and introduce a new
+# parameter that tells if it should be on/off
 class CustomWanSelfAttention(nn.Module):
     def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
         assert dim % num_heads == 0
@@ -98,6 +100,21 @@ class CustomWanSelfAttention(nn.Module):
                 )
 
             bias_kwargs["simil_masks"] = simil_masks
+
+        if (
+            not bias_kwargs["bias"]
+            or "bias_method" not in bias_kwargs
+            or bias_kwargs["bias_method"] == "none"
+        ):
+            x = flash_attention(
+                q=q, k=k, v=v, k_lens=seq_lens, window_size=self.window_size
+            )
+
+            # output
+            x = x.flatten(2)
+
+            x = self.o(x)
+            return x
 
         region_ids = torch.zeros(L_padded, dtype=torch.int32, device=q.device)
 
