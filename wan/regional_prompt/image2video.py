@@ -134,8 +134,8 @@ class WanI2V:
         else:
             self.sp_size = 1
 
-        if dist.is_initialized():  # ty:ignore[possibly-missing-attribute]
-            dist.barrier()  # ty:ignore[possibly-missing-attribute]
+        if dist.is_initialized():
+            dist.barrier()
         if dit_fsdp:
             self.model = shard_fn(self.model)
         else:
@@ -575,8 +575,8 @@ class WanI2V:
             gc.collect()
             torch.cuda.synchronize()
 
-        if dist.is_initialized():  # ty:ignore[possibly-missing-attribute]
-            dist.barrier()  # ty:ignore[possibly-missing-attribute]
+        if dist.is_initialized():
+            dist.barrier()
 
         simil_masks = torch.stack(simil_masks_list, dim=1)
 

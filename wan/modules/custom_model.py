@@ -10,7 +10,11 @@ from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange, repeat
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-from ..utils.simil_mask import compute_simil_masks
+from ..utils.simil_mask import (
+    compute_hard_simil_masks,
+    compute_soft_simil_masks,
+    compute_soft_simil_masks_iterative,
+)
 from .attention import flash_attention
 from .model import (
     WanLayerNorm,
@@ -27,8 +31,8 @@ FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
 
 
 @torch.compile
-def _flex_attention_compiled(q, k, v, block_mask):
-    return flex_attention(q, k, v, block_mask=block_mask)
+def _flex_attention_compiled(q, k, v, score_mod=None, block_mask=None):
+    return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
 
 
 # TODO: we have to make the masked self attention optional, and introduce a new
@@ -76,36 +80,35 @@ class CustomWanSelfAttention(nn.Module):
         k = rope_apply(k, grid_sizes, freqs).to(v.dtype)
 
         [[T, H, W]] = grid_sizes
-        L_orig = T * H * W
         face_masks = bias_kwargs["face_masks"]
 
-        ALIGNMENT = 128
-        pad_len = (ALIGNMENT - (L_orig % ALIGNMENT)) % ALIGNMENT
-        L_padded = L_orig + pad_len
+        # NOTE: in this way we are computing the simil_masks only in the first block
+        # and then using the sored masks for all subsequent blocks.
+        # if (simil_masks := bias_kwargs.get("simil_masks")) is None:
+        simil_masks_type = bias_kwargs["simil_masks_type"]
+        if simil_masks_type == "fixed":
+            face_masks = bias_kwargs["face_masks"]
+            simil_masks = repeat(
+                face_masks, "num_char (H W) -> 1 num_char (T H W)", T=T, H=H, W=W
+            )
+        elif simil_masks_type == "hard":
+            simil_masks = compute_hard_simil_masks(
+                q,
+                k,
+                face_masks,
+                grid_sizes,
+                #  use_rope=True,
+                #  freqs=freqs,
+            )
+        elif simil_masks_type == "soft":
+            # simil_masks = compute_soft_simil_masks_iterative(
+            simil_masks = compute_soft_simil_masks(q, k, face_masks, grid_sizes)
+        else:
+            raise ValueError("simil_masks unknown!")
 
-        if (simil_masks := bias_kwargs.get("simil_masks")) is None:
-            if bias_kwargs.get("simil_masks_type") == "fixed":
-                face_masks = bias_kwargs["face_masks"]
-                simil_masks = repeat(
-                    face_masks, "num_char (H W) -> 1 num_char (T H W)", T=T, H=H, W=W
-                )
-            else:
-                simil_masks = compute_simil_masks(
-                    q,
-                    k,
-                    face_masks,
-                    grid_sizes,
-                    #  use_rope=True,
-                    #  freqs=freqs,
-                )
+        bias_kwargs["simil_masks"] = simil_masks
 
-            bias_kwargs["simil_masks"] = simil_masks
-
-        if (
-            not bias_kwargs["bias"]
-            or "bias_method" not in bias_kwargs
-            or bias_kwargs["bias_method"] == "none"
-        ):
+        if bias_kwargs["bias_method"] == "none":
             x = flash_attention(
                 q=q, k=k, v=v, k_lens=seq_lens, window_size=self.window_size
             )
@@ -116,54 +119,67 @@ class CustomWanSelfAttention(nn.Module):
             x = self.o(x)
             return x
 
-        region_ids = torch.zeros(L_padded, dtype=torch.int32, device=q.device)
+        # NOTE: flex_attention is efficient when the seq_len is a multiple of 128.
+        # For this reason we add padding.
+        # L_orig = T * H * W
+        # ALIGNMENT = 128
+        # pad_len = (ALIGNMENT - (L_orig % ALIGNMENT)) % ALIGNMENT
 
-        for i, mask in enumerate(simil_masks[0]):
-            char_bit = 1 << i
-            region_ids[:L_orig][mask] |= char_bit
+        # remove singleton batch dim
+        simil_masks = simil_masks[0]
+        n_masks = len(simil_masks)
 
-            # char_id = i + 1
-            # region_ids[:L_orig][mask] = char_id
-
-        def isolation_logic(_b, _h, q_idx, k_idx):
-            id_q = region_ids[q_idx]
-            id_k = region_ids[k_idx]
-
-            # TODO: maybe allow chars tokens to attend to bg only after a certain number of blocks?
-
-            # check if either is background (0)
-            is_bg = (id_q == 0) | (id_k == 0)
-
-            # check if they share any common bit (overlap)
-            shares_identity = (id_q & id_k) != 0
-
-            # is_same_char = id_q == id_k
-            # return is_bg | is_same_char
-
-            return is_bg | shares_identity
-
-        block_mask = create_block_mask(
-            isolation_logic, 1, 1, L_padded, L_padded, device=q.device
+        I, J = torch.meshgrid(
+            torch.arange(n_masks), torch.arange(n_masks), indexing="ij"
         )
+        M = ((I == 0) | (J == 0) | (I == J)).to(q)
+        # M must be symmetric
+        assert torch.allclose(M, M.T)
+
+        simil_masks = simil_masks.float()
+
+        # we precompute A.T @ M outside the `mask_mod` kernel
+        AM_all = simil_masks.T @ M
+        B_all = simil_masks.T
+
+        sums = simil_masks.sum(dim=0)
+        assert torch.allclose(sums, torch.tensor(1.0).to(sums), atol=1e-2), (
+            f"sums range: {sums.min()} {sums.max()}"
+        )
+
+        # if pad_len > 0:
+        #     simil_masks = F.pad(simil_masks, (0, pad_len))
+
+        def mask_mod(score, b, h, q_idx, kv_idx):
+            # we don't need b (batch) and head (h)
+
+            # take the two 3-vectors A and B (that sum to one) from all_masks
+            AM = AM_all[q_idx]
+            B = B_all[kv_idx]
+
+            # compute the bilinear form C = A.T @ M @ B
+            C = AM @ B
+
+            bias = torch.log(C.clamp(min=1e-10))
+            bias = torch.where(C > 0, bias, float('-inf'))
+
+            return score + bias
 
         q = rearrange(q, "N L H E -> N H L E")
         k = rearrange(k, "N L H E -> N H L E")
         v = rearrange(v, "N L H E -> N H L E")
 
-        if pad_len > 0:
-            q = F.pad(q, (0, 0, 0, pad_len))
-            k = F.pad(k, (0, 0, 0, pad_len))
-            v = F.pad(v, (0, 0, 0, pad_len))
+        # if pad_len > 0:
+        #     q = F.pad(q, (0, 0, 0, pad_len))
+        #     k = F.pad(k, (0, 0, 0, pad_len))
+        #     v = F.pad(v, (0, 0, 0, pad_len))
 
-        # NOTE: flex_attention is efficient when the seq_len is a multiple of 128.
-        # For this reason we add padding.
-        # TODO: make block_mask optional, based on a config option
-        result = _flex_attention_compiled(q, k, v, block_mask=block_mask)
+        result = _flex_attention_compiled(q, k, v, score_mod=mask_mod)
         # this is just to please the type checker...
         x = result[0] if isinstance(result, tuple) else result
 
-        if pad_len > 0:
-            x = x[:, :, :L_orig, :]
+        # if pad_len > 0:
+        #     x = x[:, :, :L_orig, :]
 
         x = rearrange(x, "N H L E -> N L (H E)")
 
@@ -241,12 +257,13 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             v = self.v(context).view(b, -1, n, d)
 
             out_x = flash_attention(q, k, v, k_lens=None)
+            # merge heads and channel dims
             out_x = out_x.flatten(2)
 
             k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
             v_img = self.v_img(context_img).view(b, -1, n, d)
             img_out_x = flash_attention(q, k_img, v_img, k_lens=None)
-            # this merges heads and channel dims
+            # merge heads and channel dims
             img_out_x = img_out_x.flatten(2)
 
             return self.o(out_x + img_out_x)
@@ -270,26 +287,22 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             if general_prompt_ctx is None:
                 raise ValueError
 
-            bg_attn_out = _compute_attn(q, general_prompt_ctx, context_img)
+            simil_masks = simil_masks.unsqueeze(-1).to(dtype=q.dtype)
+            bg_mask, char_masks = simil_masks[:, 0], simil_masks[:, 1:]
 
-            pixel_counts = simil_masks.sum(dim=1).unsqueeze(-1).to(dtype=q.dtype)
-
-            total_char_attn = torch.zeros_like(bg_attn_out)
+            bg_attn = _compute_attn(q, general_prompt_ctx, context_img)
+            total_attn = bg_attn * bg_mask
 
             for i, full_ctx in enumerate(full_contexts):
-                char_mask = simil_masks[:, i].unsqueeze(-1).to(dtype=q.dtype)
+                char_mask = char_masks[:, i]
 
                 ctx_img = full_ctx[:, :image_context_length]
                 sentence_ctx = full_ctx[:, image_context_length:]
 
-                char_attn_out = _compute_attn(q, sentence_ctx, ctx_img)
+                char_attn = _compute_attn(q, sentence_ctx, ctx_img)
+                total_attn += char_attn * char_mask
 
-                total_char_attn += char_attn_out * char_mask
-
-            is_char_region = pixel_counts > 0
-            avg_char_attn = total_char_attn / pixel_counts.clamp(min=1.0)
-
-            return torch.where(is_char_region, avg_char_attn, bg_attn_out)
+            return total_attn
 
         tokens_data_list = bias_kwargs["tokens_data_list"]
         simil_masks = bias_kwargs["simil_masks"]
@@ -299,6 +312,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         attn_mask = _compute_attn_mask(
             main_token_mask=full_token_mask,
             token_data_list=tokens_data_list,
+            # FIX: if we plan to use this code, again, we need to remove the bg mask
             simil_masks=simil_masks,
             wlw_matrix=wlw_matrix,
         )
@@ -701,8 +715,14 @@ class CustomWanModel(ModelMixin, ConfigMixin):
 
         face_masks = bias_kwargs["face_masks"]
         face_masks = rearrange(face_masks.float(), "N H W -> N 1 H W")
+
+        # TODO: if we use max pooling, non-overlapping masks can become overlapping.
+        # with simple interpolation, some mask border can be 'cut'
+
         # adaptive max pool acts as a logical OR, ensuring no positive mask regions are lost during downscaling
-        face_masks = F.adaptive_max_pool2d(face_masks, (H, W))
+        # face_masks = F.adaptive_max_pool2d(face_masks, (H, W))
+        face_masks = F.interpolate(face_masks, size=(H, W), mode='nearest')
+
         face_masks = rearrange(face_masks.bool(), "N 1 H W -> N (H W)")
         bias_kwargs["face_masks"] = face_masks.to(device)
 
