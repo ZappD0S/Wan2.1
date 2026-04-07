@@ -132,3 +132,144 @@ def compute_soft_simil_masks(query, key, face_masks, grid_sizes, chunk_size=512)
     return S
 
 
+# def compute_soft_simil_masks_iterative(
+#     query, key, face_masks, grid_sizes, chunk_size=256
+# ):
+#     [[T, H, W]] = grid_sizes
+#     N_batch = query.shape[0]
+#
+#     query_frames = rearrange(
+#         query, "N (T H W) num_heads E -> N T (H W) num_heads E", T=T, H=H, W=W
+#     )
+#     key_frames = rearrange(
+#         key, "N (T H W) num_heads E -> N T (H W) num_heads E", T=T, H=H, W=W
+#     )
+#
+#     q_batched = rearrange(
+#         query_frames[:, 1:], "N T L num_heads E -> (N T) L num_heads E"
+#     )
+#     k_batched = rearrange(
+#         key_frames[:, :-1], "N T L num_heads E -> (N T) L num_heads E"
+#     )
+#
+#     # Output shape: ((N * T-1), L, S) where L = S = H*W. (Heads are averaged inside here)
+#     attn_weights = compute_attn_weights(q_batched, k_batched, chunk_size=chunk_size)
+#
+#     attn_weights = rearrange(attn_weights, "(N T) L S -> N T L S", N=N_batch)
+#
+#     background_mask = ~(face_masks.any(dim=0, keepdim=True))
+#     all_masks = torch.cat([background_mask, face_masks], dim=0).float()
+#
+#     S_0 = all_masks.unsqueeze(0).expand(N_batch, -1, -1)
+#     S_0 = S_0 / (S_0.sum(dim=0, keepdim=True) + 1e-8)
+#
+#     S_frames = [S_0]
+#     current_masks = S_0
+#
+#     for t in range(T - 1):
+#         attn_t = attn_weights[:, t]  # Shape: (N, L, S)
+#
+#         S_t = einsum(current_masks, attn_t, "N P S, N L S -> N P L")
+#         S_t = S_t / (S_t.sum(dim=1, keepdim=True) + 1e-8)
+#
+#         S_frames.append(S_t)
+#
+#         hard_mask_idx = S_t.argmax(dim=1, keepdim=True)
+#         current_masks = torch.zeros_like(S_t).scatter_(1, hard_mask_idx, 1.0)
+#
+#     S = torch.cat(S_frames, dim=2)  # Shape: (N, P, T*H*W)
+#
+#     sums = S.sum(dim=1)
+#     assert torch.allclose(sums, torch.tensor(1.0, dtype=sums.dtype, device=S.device)), (
+#         f"sums range: {sums.min()} {sums.max()}"
+#     )
+#
+#     # Remove background mask
+#     soft_masks = S[:, 1:, :]
+#
+#     return soft_masks
+
+
+@torch.no_grad()
+def compute_soft_simil_masks_iterative(
+    query, key, face_masks, grid_sizes, chunk_size=128
+):
+    [[T, H, W]] = grid_sizes
+    N_batch = query.shape[0]
+
+    # 1. Separate the time dimension
+    query_frames = rearrange(
+        query,
+        "N (T H W) num_heads E -> N T (H W) num_heads E",
+        N=N_batch,
+        T=T,
+        H=H,
+        W=W,
+    )
+    key_frames = rearrange(
+        key, "N (T H W) num_heads E -> N T (H W) num_heads E", N=N_batch, T=T, H=H, W=W
+    )
+
+    # 2. PREPARE KEYS FOR ANCHORING
+    # Extract Frame 0 keys and expand them to match the T-1 temporal steps
+    k_0 = key_frames[:, 0:1].expand(
+        -1, T - 1, -1, -1, -1
+    )  # Shape: (N, T-1, L, num_heads, E)
+    k_prev = key_frames[:, :-1]  # Shape: (N, T-1, L, num_heads, E)
+
+    # Concatenate Frame 0 and Frame t-1 keys along the spatial dimension L
+    # The new spatial dimension is now 2*L
+    k_combined = torch.cat([k_0, k_prev], dim=2)
+
+    # 3. Batched Native Attention (Query attends to BOTH 0 and t-1)
+    q_batched = rearrange(
+        query_frames[:, 1:], "N T_minus_1 L num_heads E -> (N T_minus_1) L num_heads E"
+    )
+    k_batched = rearrange(
+        k_combined, "N T_minus_1 Two_L num_heads E -> (N T_minus_1) Two_L num_heads E"
+    )
+
+    # The resulting attention weights will have shape (N*(T-1), L, 2*L)
+    batched_attn_weights = compute_attn_weights(
+        q_batched, k_batched, chunk_size=chunk_size
+    )
+    batched_attn_weights = rearrange(
+        batched_attn_weights, "(N T_minus_1) L Two_L -> N T_minus_1 L Two_L", N=N_batch
+    )
+
+    # 4. Prepare initial perfect masks for Frame 0
+    background_mask = ~(face_masks.any(dim=0, keepdim=True))
+    all_masks = torch.cat([background_mask, face_masks], dim=0).float()
+
+    S_0 = all_masks.unsqueeze(0).expand(N_batch, -1, -1)
+    S_0 = S_0 / (S_0.sum(dim=1, keepdim=True) + 1e-8)
+
+    S_frames = [S_0]
+    current_masks = S_0  # S_{t-1}
+
+    # ---------------------------------------------------------
+    # ANCHORED SEQUENTIAL MASK PROPAGATION
+    # ---------------------------------------------------------
+    for t in range(T - 1):
+        attn_t = batched_attn_weights[:, t]  # Shape: (N, L, 2*L)
+
+        # Concatenate the perfect Frame 0 mask with the current Frame t-1 mask
+        # combined_masks shape: (N, P, 2*L)
+        combined_masks = torch.cat([S_0, current_masks], dim=2)
+
+        # Propagate to get the new SOFT mask
+        # Attention maps the 2*L spatial keys back into the L spatial queries
+        S_t_soft = einsum(combined_masks, attn_t, "N P Two_L, N L Two_L -> N P L")
+
+        # Normalize so probabilities sum to 1
+        S_t_soft = S_t_soft / (S_t_soft.sum(dim=1, keepdim=True) + 1e-8)
+
+        S_frames.append(S_t_soft)
+
+        # Update current masks for the next step
+        current_masks = S_t_soft
+
+    # Concatenate sequence along the spatial/temporal dimension L
+    S = torch.cat(S_frames, dim=2)  # Shape: (N, P, T*H*W)
+
+    return S

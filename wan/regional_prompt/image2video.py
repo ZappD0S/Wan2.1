@@ -32,7 +32,8 @@ from ..utils.fm_solvers import (
 from ..utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from ..utils.subsequence import get_nested_subsequence_mask
 
-NEGATIVE_PROMPT = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+# NEGATIVE_PROMPT = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+NEGATIVE_PROMPT = "Bright tones, overexposed, blurred details, subtitles, style, works, paintings, images, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, deformed, disfigured, misshapen limbs, messy background, walking backwards, disembodied hands, person entering frame, phantom limbs, floating arms, reaching in, extra limbs, camera movement, panning, zooming, zoom in, zoom out, dolly, tilting, moving camera, shaky camera"
 
 
 class WanI2V:
