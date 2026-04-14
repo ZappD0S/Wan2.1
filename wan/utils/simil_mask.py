@@ -3,6 +3,7 @@ import math
 import einops
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 from einops import einsum, rearrange, reduce
 
 from ..modules.model import rope_apply
@@ -44,6 +45,44 @@ def compute_attn_weights(query, key, T=1.0, chunk_size=512):
     return avg_attn_weights
 
 
+def check_mece(S) -> bool:
+    mask_zero = torch.isclose(S, torch.tensor(0.0, dtype=S.dtype, device=S.device))
+    mask_one = torch.isclose(S, torch.tensor(1.0, dtype=S.dtype, device=S.device))
+    assert (mask_zero | mask_one).all()
+
+    sums = S.sum(dim=1)
+
+    return torch.allclose(sums, torch.tensor(1.0, dtype=sums.dtype, device=S.device))
+
+
+def discretize_masks(soft_masks, threshold, bg_idx=0):
+
+    max_scores, max_inds = torch.max(soft_masks, dim=1)
+    is_valid_entity = (max_scores > threshold) & (max_inds != bg_idx)
+    final_classes = torch.where(is_valid_entity, max_inds, bg_idx)
+
+    hard_masks = torch.zeros_like(soft_masks)
+    hard_masks.scatter_(dim=1, index=final_classes.unsqueeze(1), value=1.0)
+
+    return hard_masks
+
+
+def apply_gaussian_smooth(soft_masks, grid_sizes, kernel_size=5, sigma=1.0):
+    [[T, H, W]] = grid_sizes
+
+    # masks_2d = soft_masks.view(B, C, H, W)
+    masks_2d = rearrange(soft_masks, "B C (T H W) -> B C T H W", T=T, H=H, W=W)
+
+    smoothed_masks_2d = TF.gaussian_blur(
+        masks_2d, kernel_size=[kernel_size, kernel_size], sigma=[sigma, sigma]
+    )
+
+    # smoothed_masks = smoothed_masks_2d.view(B, C, L)
+    smoothed_masks = rearrange(smoothed_masks_2d, "B C T H W -> B C (T H W)")
+
+    return smoothed_masks
+
+
 def compute_hard_simil_masks(
     query,
     key,
@@ -52,6 +91,8 @@ def compute_hard_simil_masks(
     use_rope=False,
     freqs=None,
     chunk_size=512,
+    threshold=0.0,
+    smooth=False,
 ):
     [[T, H, W]] = grid_sizes
 
@@ -91,23 +132,19 @@ def compute_hard_simil_masks(
 
     S = einsum(all_masks.float(), attn_weights, "P S, N L S -> N P L")
 
-    inds = S.argmax(dim=1, keepdim=True)
-    S = torch.zeros_like(S).scatter_(1, inds, 1.0)
+    if smooth:
+        S = apply_gaussian_smooth(S, grid_sizes)
 
-    mask_zero = torch.isclose(S, torch.tensor(0.0, dtype=S.dtype, device=S.device))
-    mask_one = torch.isclose(S, torch.tensor(1.0, dtype=S.dtype, device=S.device))
-    assert (mask_zero | mask_one).all()
+    S_hat = discretize_masks(S, threshold)
 
-    sums = S.sum(dim=1)
-    assert torch.allclose(sums, torch.tensor(1.0, dtype=sums.dtype, device=S.device)), (
-        f"sums range: {sums.min()} {sums.max()}"
-    )
+    assert check_mece(S_hat)
 
-    return S
+    return S_hat
 
 
-# TODO: make temperature configurable?
-def compute_soft_simil_masks(query, key, face_masks, grid_sizes, chunk_size=512):
+def compute_soft_simil_masks(
+    query, key, face_masks, grid_sizes, temperature=1.0, chunk_size=512
+):
     [[T, H, W]] = grid_sizes
 
     key_first_frame = rearrange(
@@ -122,7 +159,7 @@ def compute_soft_simil_masks(query, key, face_masks, grid_sizes, chunk_size=512)
     # apply the masks to the attention masks
     # P is for 'people' (it means # of masks)
     S = einsum(all_masks.float(), attn_weights, "P S, N L S -> N P L")
-    S = torch.softmax(S, dim=1)
+    S = torch.softmax(S / temperature, dim=1)
 
     sums = S.sum(dim=1)
     assert torch.allclose(sums, torch.tensor(1.0, dtype=sums.dtype, device=S.device)), (

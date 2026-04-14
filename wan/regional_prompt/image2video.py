@@ -487,8 +487,14 @@ class WanI2V:
 
         if isinstance(seed, int):
             seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
+
+            if dist.is_initialized():
+                seed_tensor = torch.tensor([seed], dtype=torch.long, device=self.device)
+                dist.broadcast(seed_tensor, src=0)
+                seed = seed_tensor.item()  # ty:ignore[invalid-assignment]
+
             seed_g = torch.Generator(device=self.device)
-            seed_g.manual_seed(seed)
+            seed_g.manual_seed(seed)  # ty:ignore[invalid-argument-type]
         elif isinstance(seed, torch.Generator):
             seed_g = seed
         else:
@@ -524,6 +530,7 @@ class WanI2V:
 
             self.model.to(self.device)  # ty:ignore[invalid-argument-type]
             simil_masks_list = []
+            # NOTE: timesteps is a decreasing sequence (1.0 -> 0.0)
             for i, t in enumerate(tqdm(timesteps[i0:])):
                 bias_timestep = timestep_bias_schedule[i + i0]
 
