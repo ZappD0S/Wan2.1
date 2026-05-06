@@ -137,6 +137,9 @@ class WanI2V:
 
         if dist.is_initialized():
             dist.barrier()
+
+        self.model.to(self.param_dtype)
+
         if dit_fsdp:
             self.model = shard_fn(self.model)
         else:
