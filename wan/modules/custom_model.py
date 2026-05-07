@@ -466,7 +466,7 @@ class CustomWanAttentionBlock(nn.Module):
         # self-attention
 
         y, simil_masks = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0],
+            (self.norm1(x).float() * (1 + e[1]) + e[0]).to(x.dtype),
             seq_lens,
             grid_sizes,
             freqs,
@@ -484,7 +484,7 @@ class CustomWanAttentionBlock(nn.Module):
             self.norm3(x), context, grid_sizes, simil_masks, bias_kwargs=bias_kwargs
         )
         x = x + x_cross_attn
-        y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+        y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(x.dtype))
 
         with torch.autocast("cuda", dtype=torch.float32):
             x = x + y * e[5]
