@@ -122,17 +122,15 @@ class CustomWanSelfAttention(nn.Module):
         b, s = x.shape[:2]
         n, d = self.num_heads, self.head_dim
 
-        # query, key, value function
-        def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        q = rope_apply(q, grid_sizes, freqs).to(q.dtype)
 
-        q, k, v = qkv_fn(x)
+        k = self.norm_k(self.k(x)).view(b, s, n, d)
+        k = rope_apply(k, grid_sizes, freqs).to(k.dtype)
 
-        q = rope_apply(q, grid_sizes, freqs).to(v.dtype)
-        k = rope_apply(k, grid_sizes, freqs).to(v.dtype)
+        v = self.v(x).view(b, s, n, d)
+
+        del x
 
         # NOTE: in this way we are computing the simil_masks only in the first block
         # and then using the sored masks for all subsequent blocks.
@@ -298,6 +296,7 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
         context = context[:, image_context_length:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        del x
 
         bias_method = bias_kwargs["bias_method"]
 

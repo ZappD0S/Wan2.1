@@ -359,6 +359,7 @@ class WanI2V:
             context_null = [t.to(self.device) for t in context_null]
         elif offload_model:
             self.text_encoder.model.cpu()
+            torch.cuda.empty_cache()
 
         clip_context = self.clip.visual([img_tensor[:, None, :, :]])
 
