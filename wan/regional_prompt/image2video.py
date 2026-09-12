@@ -3,8 +3,6 @@ import gc
 import logging
 import math
 import os
-import random
-import sys
 import types
 from contextlib import contextmanager
 from functools import partial
@@ -30,7 +28,9 @@ from ..utils.fm_solvers import (
     retrieve_timesteps,
 )
 from ..utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from ..utils.seed import initialize_diffusion_noise, resolve_diffusion_seed
 from ..utils.subsequence import get_nested_subsequence_mask
+from ..utils.token_contracts import prefix_for_concatenated_context
 
 # NEGATIVE_PROMPT = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
 NEGATIVE_PROMPT = "Bright tones, overexposed, blurred details, subtitles, style, works, paintings, images, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, deformed, disfigured, misshapen limbs, messy background, walking backwards, disembodied hands, person entering frame, phantom limbs, floating arms, reaching in, extra limbs, camera movement, panning, zooming, zoom in, zoom out, dolly, tilting, moving camera, shaky camera"
@@ -266,6 +266,9 @@ class WanI2V:
         else:
             general_prompt_context = []
 
+        if len(prompt_sentences) != len(prompt_data_list):
+            raise ValueError("prompt_sentences and prompt_data_list must have equal length")
+
         for sentence, prompt_data in zip(
             prompt_sentences, prompt_data_list, strict=True
         ):
@@ -280,8 +283,6 @@ class WanI2V:
                 )
                 single_char_img_contexts.append(single_char_img_context)
 
-            cum_len = sum(ctx.size(0) for ctx in sentence_contexts)
-
             [full_token_ids], [full_token_mask_np] = tokenizer(
                 sentence,
                 return_mask=True,
@@ -292,6 +293,10 @@ class WanI2V:
             full_token_mask = torch.from_numpy(full_token_mask_np).to(
                 dtype=torch.bool, device=self.device
             )
+            if full_token_mask.numel() != sentence_context.size(0):
+                raise ValueError(
+                    "tokenizer mask length does not match encoded sentence context length"
+                )
 
             for inds, prompt_data in control_prompts:
                 add_special_tokens = sentence.endswith(prompt_data["prompt"])
@@ -305,12 +310,14 @@ class WanI2V:
                 action_token_mask_np = get_nested_subsequence_mask(
                     full_token_ids, [action_token_ids]
                 )
-                action_token_mask_np = np.append(
-                    np.zeros(cum_len, dtype=bool), action_token_mask_np
+                action_token_mask = prefix_for_concatenated_context(
+                    torch.from_numpy(action_token_mask_np).to(
+                        dtype=torch.bool, device=self.device
+                    ),
+                    [ctx.size(0) for ctx in sentence_contexts],
                 )
-                action_token_mask = torch.from_numpy(action_token_mask_np).to(
-                    dtype=torch.bool, device=self.device
-                )
+                if not action_token_mask.any():
+                    raise ValueError(f"control prompt was not found in sentence: {sentence!r}")
 
                 char_descr_masks_list = []
                 for char_descr in prompt_data["char_descr_list"]:
@@ -325,14 +332,19 @@ class WanI2V:
                         full_token_ids,
                         [action_token_ids, char_descr_token_ids],
                     )
-                    char_descr_mask_np = np.append(
-                        np.zeros(cum_len, dtype=bool), char_descr_mask_np
-                    )
-                    char_descr_mask = torch.from_numpy(char_descr_mask_np).to(
-                        dtype=torch.bool, device=self.device
+                    char_descr_mask = prefix_for_concatenated_context(
+                        torch.from_numpy(char_descr_mask_np).to(
+                            dtype=torch.bool, device=self.device
+                        ),
+                        [ctx.size(0) for ctx in sentence_contexts],
                     )
 
-                    assert not (char_descr_mask & (~action_token_mask)).any()
+                    if not char_descr_mask.any():
+                        raise ValueError(
+                            f"character description was not found in control prompt: {char_descr!r}"
+                        )
+                    if (char_descr_mask & (~action_token_mask)).any():
+                        raise ValueError("character token mask escapes its action token mask")
                     char_descr_masks_list.append(char_descr_mask)
 
                 tokens_data_list.append(
@@ -348,6 +360,13 @@ class WanI2V:
 
         context = [torch.cat(sentence_contexts)]
         full_token_mask = torch.cat(full_token_masks_list)
+        if context[0].size(0) > self.model.text_len:
+            raise ValueError(
+                f"concatenated prompt has {context[0].size(0)} tokens; "
+                f"model limit is {self.model.text_len}"
+            )
+        if full_token_mask.numel() != context[0].size(0):
+            raise ValueError("global token mask and concatenated context lengths differ")
 
         if self.t5_cpu:
             general_prompt_context = [t.to(self.device) for t in general_prompt_context]
@@ -428,12 +447,15 @@ class WanI2V:
         cond_kwargs["context"] = context
         cond_kwargs["bias_kwargs"] = bias_kwargs
 
-        [noise_pred_cond], simil_masks = self.model(latent, **cond_kwargs)
+        [noise_pred_cond], simil_masks, generated_simil_masks = self.model(
+            latent, **cond_kwargs
+        )
         assert "simil_masks" not in bias_kwargs
 
         if offload_model:
             noise_pred_cond = noise_pred_cond.to('cpu')
             simil_masks = simil_masks.to('cpu')
+            generated_simil_masks = generated_simil_masks.to('cpu')
 
             torch.cuda.empty_cache()
 
@@ -451,7 +473,7 @@ class WanI2V:
             noise_pred_cond - noise_pred_uncond
         )
 
-        return noise_pred, simil_masks
+        return noise_pred, simil_masks, generated_simil_masks
 
     def generate_from_latents(
         self,
@@ -490,23 +512,21 @@ class WanI2V:
             i0 = idx[0][0].item()
 
         if isinstance(seed, int):
-            seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-
-            if dist.is_initialized():
-                seed_tensor = torch.tensor([seed], dtype=torch.long, device=self.device)
-                dist.broadcast(seed_tensor, src=0)
-                seed = seed_tensor.item()  # ty:ignore[invalid-assignment]
-
+            seed = resolve_diffusion_seed(seed, self.device)
             seed_g = torch.Generator(device=self.device)
-            seed_g.manual_seed(seed)  # ty:ignore[invalid-argument-type]
+            seed_g.manual_seed(seed)
         elif isinstance(seed, torch.Generator):
             seed_g = seed
         else:
             raise ValueError
 
-        timestep_bias_schedule = bias_kwargs.pop("timestep_bias_schedule")
-
         bias_kwargs = bias_kwargs.copy()
+        timestep_bias_schedule = bias_kwargs.pop("timestep_bias_schedule")
+        if len(timestep_bias_schedule) != len(timesteps):
+            raise ValueError(
+                "timestep_bias_schedule length must match scheduler timestep count"
+            )
+
         img_tensor = self._img_to_tensor(img)
         y, max_seq_len = self._build_latents(img_tensor, frame_num, max_area)
         context, context_null, clip_context, bias_kwargs = self._build_context(
@@ -534,6 +554,7 @@ class WanI2V:
 
             self.model.to(self.device)  # ty:ignore[invalid-argument-type]
             simil_masks_list = []
+            generated_simil_masks_list = []
             # NOTE: timesteps is a decreasing sequence (1.0 -> 0.0)
             for i, t in enumerate(tqdm(timesteps[i0:])):
                 bias_timestep = timestep_bias_schedule[i + i0]
@@ -543,18 +564,20 @@ class WanI2V:
 
                 norm_t = timestep / self.num_train_timesteps
                 assert (0.0 <= norm_t) and (norm_t <= 1.0)
-                noise_pred, simil_masks = self._compute_noise_pred(
-                    [latent],
-                    timestep,
-                    [y],
-                    context=context,
-                    context_null=context_null,
-                    clip_context=clip_context,
-                    bias_kwargs=bias_kwargs
-                    | {"normalized_timestep": norm_t, "bias": bias_timestep},
-                    max_seq_len=max_seq_len,
-                    guide_scale=guide_scale,
-                    offload_model=offload_model,
+                noise_pred, simil_masks, generated_simil_masks = (
+                    self._compute_noise_pred(
+                        [latent],
+                        timestep,
+                        [y],
+                        context=context,
+                        context_null=context_null,
+                        clip_context=clip_context,
+                        bias_kwargs=bias_kwargs
+                        | {"normalized_timestep": norm_t, "bias": bias_timestep},
+                        max_seq_len=max_seq_len,
+                        guide_scale=guide_scale,
+                        offload_model=offload_model,
+                    )
                 )
 
                 latent = latent.to(
@@ -562,7 +585,9 @@ class WanI2V:
                 )
 
                 simil_masks = simil_masks.to("cpu")
+                generated_simil_masks = generated_simil_masks.to("cpu")
                 simil_masks_list.append(simil_masks)
+                generated_simil_masks_list.append(generated_simil_masks)
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
@@ -591,8 +616,16 @@ class WanI2V:
             dist.barrier()
 
         simil_masks = torch.stack(simil_masks_list, dim=1)
+        generated_simil_masks = torch.stack(generated_simil_masks_list, dim=1)
 
-        extra_data = {"simil_masks": simil_masks}
+        extra_data = {
+            # Backwards-compatible name: these are exactly the masks consumed by
+            # both self- and cross-attention and shown by existing diagnostics.
+            "simil_masks": simil_masks,
+            "used_simil_masks": simil_masks,
+            "generated_simil_masks": generated_simil_masks,
+            "diffusion_seed": int(seed_g.initial_seed()),
+        }
         return (videos[0], extra_data) if self.rank == 0 else None
 
     def generate(
@@ -647,12 +680,15 @@ class WanI2V:
                 - W: Frame width from max_area)
         """
 
-        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
-        seed_g.manual_seed(seed)
-
+        # Resolve and synchronize the integer before any public-path noise is made.
         w, h = img.size
-        noise = self._generate_noise((h, w), max_area, frame_num, seed_g)
+        seed, seed_g, noise = initialize_diffusion_noise(
+            seed,
+            self.device,
+            lambda generator: self._generate_noise(
+                (h, w), max_area, frame_num, generator
+            ),
+        )
 
         return self.generate_from_latents(
             img,
