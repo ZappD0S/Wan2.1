@@ -26,6 +26,10 @@ from ..utils.simil_mask import (
     compute_soft_simil_masks,
     compute_soft_simil_masks_iterative,
 )
+from ..utils.runtime_evidence import (
+    emit_runtime_observation,
+    runtime_observation_scope,
+)
 from .attention import flash_attention
 from .model import (
     WanLayerNorm,
@@ -106,6 +110,7 @@ class CustomWanSelfAttention(nn.Module):
             smooth = bias_kwargs.get("gaussian_smoothing", False)
             threshold = bias_kwargs.get("mask_confidence_threshold", 0.0)
 
+            emit_runtime_observation("tracker-call", tracker="hard-similarity-mask")
             dyn_simil_masks = compute_hard_simil_masks(
                 q,
                 k,
@@ -115,6 +120,7 @@ class CustomWanSelfAttention(nn.Module):
                 smooth=smooth,
             )
         elif simil_masks_type == "soft":
+            emit_runtime_observation("tracker-call", tracker="soft-similarity-mask")
             dyn_simil_masks = compute_soft_simil_masks(
                 q, k, face_masks, grid_sizes, temperature=0.1
             )
@@ -151,6 +157,11 @@ class CustomWanSelfAttention(nn.Module):
             q, k, grid_sizes, bias_kwargs
         )
         used_simil_masks = select_used_simil_masks(generated_simil_masks, simil_masks)
+        emit_runtime_observation(
+            "self-mask-consumer",
+            used_mask_tensor=used_simil_masks,
+            generated_mask_tensor=generated_simil_masks,
+        )
 
         if not self_attention_bias_enabled(bias_kwargs):
             x = flash_attention(
@@ -206,6 +217,11 @@ class CustomWanSelfAttention(nn.Module):
         #     k = F.pad(k, (0, 0, 0, pad_len))
         #     v = F.pad(v, (0, 0, 0, pad_len))
 
+        emit_runtime_observation(
+            "attention-dispatch",
+            backend="flex_attention",
+            backend_version=torch.__version__,
+        )
         result = _run_flex_attention(q, k, v, AM_all, B_all)
 
         # this is just to please the type checker...
@@ -235,6 +251,10 @@ class CustomWanI2VCrossAttention(CustomWanSelfAttention):
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
         """
+
+        emit_runtime_observation(
+            "cross-mask-consumer", used_mask_tensor=simil_masks
+        )
 
         def _compute_attn_mask(
             main_token_mask, token_data_list, simil_masks, wlw_matrix
@@ -478,14 +498,15 @@ class CustomWanAttentionBlock(nn.Module):
 
         # self-attention
 
-        y, generated_simil_masks, used_simil_masks = self.self_attn(
-            (self.norm1(x).float() * (1 + e[1]) + e[0]).to(x.dtype),
-            seq_lens,
-            grid_sizes,
-            freqs,
-            simil_masks,
-            bias_kwargs=bias_kwargs,
-        )
+        with runtime_observation_scope(attention_site="self"):
+            y, generated_simil_masks, used_simil_masks = self.self_attn(
+                (self.norm1(x).float() * (1 + e[1]) + e[0]).to(x.dtype),
+                seq_lens,
+                grid_sizes,
+                freqs,
+                simil_masks,
+                bias_kwargs=bias_kwargs,
+            )
 
         assert generated_simil_masks is not None
         assert used_simil_masks is not None
@@ -494,9 +515,14 @@ class CustomWanAttentionBlock(nn.Module):
 
         # cross-attention & ffn
 
-        x_cross_attn = self.cross_attn(
-            self.norm3(x), context, grid_sizes, used_simil_masks, bias_kwargs=bias_kwargs
-        )
+        with runtime_observation_scope(attention_site="cross"):
+            x_cross_attn = self.cross_attn(
+                self.norm3(x),
+                context,
+                grid_sizes,
+                used_simil_masks,
+                bias_kwargs=bias_kwargs,
+            )
         x = x + x_cross_attn
         y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(x.dtype))
 
@@ -880,16 +906,17 @@ class CustomWanModel(ModelMixin, ConfigMixin):
 
             bias_kwargs["bias"] = bias_block
 
-            x, generated_simil_masks, used_simil_masks = block(
-                x,
-                e=e0,
-                seq_lens=seq_lens,
-                grid_sizes=grid_sizes,
-                freqs=self.freqs,
-                context=context,
-                simil_masks=active_simil_masks,
-                bias_kwargs=bias_kwargs,
-            )
+            with runtime_observation_scope(block=i):
+                x, generated_simil_masks, used_simil_masks = block(
+                    x,
+                    e=e0,
+                    seq_lens=seq_lens,
+                    grid_sizes=grid_sizes,
+                    freqs=self.freqs,
+                    context=context,
+                    simil_masks=active_simil_masks,
+                    bias_kwargs=bias_kwargs,
+                )
             assert generated_simil_masks is not None
             assert used_simil_masks is not None
 

@@ -26,6 +26,10 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.runtime_evidence import (
+    emit_runtime_observation,
+    runtime_observation_scope,
+)
 
 
 class WanI2V:
@@ -221,6 +225,9 @@ class WanI2V:
             generator=seed_g,
             device=self.device,
         )
+        emit_runtime_observation(
+            "initial-latent", seed=seed, latent_tensor=noise
+        )
 
         msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
@@ -318,20 +325,28 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             self.model.to(self.device)
-            for _, t in enumerate(tqdm(timesteps)):
+            for step, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
                 timestep = torch.stack(timestep).to(self.device)
 
-                noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c)[
-                    0
-                ].to(torch.device('cpu') if offload_model else self.device)
+                with runtime_observation_scope(step=step, branch="conditional"):
+                    noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c
+                    )[0].to(torch.device('cpu') if offload_model else self.device)
+                    emit_runtime_observation(
+                        "cfg-branch-output", output_tensor=noise_pred_cond
+                    )
                 if offload_model:
                     torch.cuda.empty_cache()
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null
-                )[0].to(torch.device('cpu') if offload_model else self.device)
+                with runtime_observation_scope(step=step, branch="negative"):
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null
+                    )[0].to(torch.device('cpu') if offload_model else self.device)
+                    emit_runtime_observation(
+                        "cfg-branch-output", output_tensor=noise_pred_uncond
+                    )
                 if offload_model:
                     torch.cuda.empty_cache()
                 noise_pred = noise_pred_uncond + guide_scale * (
@@ -358,6 +373,7 @@ class WanI2V:
                 self.model.cpu()
                 torch.cuda.empty_cache()
 
+            emit_runtime_observation("final-latent", output_tensor=x0[0])
             if self.rank == 0:
                 videos = self.vae.decode(x0)
 

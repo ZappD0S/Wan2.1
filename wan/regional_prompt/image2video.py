@@ -28,6 +28,10 @@ from ..utils.fm_solvers import (
     retrieve_timesteps,
 )
 from ..utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from ..utils.runtime_evidence import (
+    emit_runtime_observation,
+    runtime_observation_scope,
+)
 from ..utils.seed import initialize_diffusion_noise, resolve_diffusion_seed
 from ..utils.subsequence import get_nested_subsequence_mask
 from ..utils.token_contracts import prefix_for_concatenated_context
@@ -447,9 +451,13 @@ class WanI2V:
         cond_kwargs["context"] = context
         cond_kwargs["bias_kwargs"] = bias_kwargs
 
-        [noise_pred_cond], simil_masks, generated_simil_masks = self.model(
-            latent, **cond_kwargs
-        )
+        with runtime_observation_scope(branch="conditional"):
+            [noise_pred_cond], simil_masks, generated_simil_masks = self.model(
+                latent, **cond_kwargs
+            )
+            emit_runtime_observation(
+                "cfg-branch-output", output_tensor=noise_pred_cond
+            )
         assert "simil_masks" not in bias_kwargs
 
         if offload_model:
@@ -463,7 +471,11 @@ class WanI2V:
         uncond_kwargs["context"] = context_null
         uncond_kwargs["bias_kwargs"] = bias_kwargs | {"bias": False}
 
-        [noise_pred_uncond], *_ = self.model(latent, **uncond_kwargs)
+        with runtime_observation_scope(branch="negative"):
+            [noise_pred_uncond], *_ = self.model(latent, **uncond_kwargs)
+            emit_runtime_observation(
+                "cfg-branch-output", output_tensor=noise_pred_uncond
+            )
 
         if offload_model:
             noise_pred_uncond = noise_pred_uncond.to('cpu')
@@ -564,21 +576,22 @@ class WanI2V:
 
                 norm_t = timestep / self.num_train_timesteps
                 assert (0.0 <= norm_t) and (norm_t <= 1.0)
-                noise_pred, simil_masks, generated_simil_masks = (
-                    self._compute_noise_pred(
-                        [latent],
-                        timestep,
-                        [y],
-                        context=context,
-                        context_null=context_null,
-                        clip_context=clip_context,
-                        bias_kwargs=bias_kwargs
-                        | {"normalized_timestep": norm_t, "bias": bias_timestep},
-                        max_seq_len=max_seq_len,
-                        guide_scale=guide_scale,
-                        offload_model=offload_model,
+                with runtime_observation_scope(step=i + i0):
+                    noise_pred, simil_masks, generated_simil_masks = (
+                        self._compute_noise_pred(
+                            [latent],
+                            timestep,
+                            [y],
+                            context=context,
+                            context_null=context_null,
+                            clip_context=clip_context,
+                            bias_kwargs=bias_kwargs
+                            | {"normalized_timestep": norm_t, "bias": bias_timestep},
+                            max_seq_len=max_seq_len,
+                            guide_scale=guide_scale,
+                            offload_model=offload_model,
+                        )
                     )
-                )
 
                 latent = latent.to(
                     torch.device('cpu') if offload_model else self.device
@@ -602,6 +615,7 @@ class WanI2V:
                 self.model.cpu()
                 torch.cuda.empty_cache()
 
+            emit_runtime_observation("final-latent", output_tensor=latent)
             videos = [None]
             if self.rank == 0:
                 videos = self.vae.decode([latent.to(self.device)])
@@ -688,6 +702,9 @@ class WanI2V:
             lambda generator: self._generate_noise(
                 (h, w), max_area, frame_num, generator
             ),
+        )
+        emit_runtime_observation(
+            "initial-latent", seed=seed, latent_tensor=noise
         )
 
         return self.generate_from_latents(

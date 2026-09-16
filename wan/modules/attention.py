@@ -15,6 +15,8 @@ except ModuleNotFoundError:
 
 import warnings
 
+from ..utils.runtime_evidence import emit_runtime_observation
+
 __all__ = [
     'flash_attention',
     'attention',
@@ -93,6 +95,11 @@ def flash_attention(
     # apply attention
     if (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
         # Note: dropout_p, window_size are not supported in FA3 now.
+        emit_runtime_observation(
+            "attention-dispatch",
+            backend="flash_attention_3",
+            backend_version=getattr(flash_attn_interface, "__version__", None),
+        )
         x = flash_attn_interface.flash_attn_varlen_func(
             q=q,
             k=k,
@@ -110,6 +117,11 @@ def flash_attention(
             deterministic=deterministic)[0].unflatten(0, (b, lq))
     else:
         assert FLASH_ATTN_2_AVAILABLE
+        emit_runtime_observation(
+            "attention-dispatch",
+            backend="flash_attention_2",
+            backend_version=getattr(flash_attn, "__version__", None),
+        )
         x = flash_attn.flash_attn_varlen_func(
             q=q,
             k=k,
@@ -172,6 +184,11 @@ def attention(
         k = k.transpose(1, 2).to(dtype)
         v = v.transpose(1, 2).to(dtype)
 
+        emit_runtime_observation(
+            "attention-dispatch",
+            backend="torch_sdpa",
+            backend_version=torch.__version__,
+        )
         out = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
 

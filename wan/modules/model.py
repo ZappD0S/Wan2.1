@@ -7,6 +7,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention
+from ..utils.runtime_evidence import runtime_observation_scope
 
 __all__ = ['WanModel']
 
@@ -298,15 +299,20 @@ class WanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
+        with runtime_observation_scope(attention_site="self"):
+            y = self.self_attn(
+                self.norm1(x).float() * (1 + e[1]) + e[0],
+                seq_lens,
+                grid_sizes,
+                freqs,
+            )
         with torch.amp.autocast("cuda", dtype=torch.float32):
             x = x + y * e[2]
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            with runtime_observation_scope(attention_site="cross"):
+                x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
             with torch.amp.autocast("cuda", dtype=torch.float32):
                 x = x + y * e[5]
@@ -570,8 +576,9 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens)
 
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        for block_index, block in enumerate(self.blocks):
+            with runtime_observation_scope(block=block_index):
+                x = block(x, **kwargs)
 
         # head
         x = self.head(x, e)
