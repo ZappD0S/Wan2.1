@@ -143,18 +143,11 @@ class CustomWanSelfAttention(nn.Module):
         b, s = x.shape[:2]
         n, d = self.num_heads, self.head_dim
 
-        pristine_parity = bias_kwargs.get("_r3_pristine_parity_arithmetic", False)
         q = self.norm_q(self.q(x)).view(b, s, n, d)
-        q_dtype = q.dtype
-        q = rope_apply(q, grid_sizes, freqs)
-        if not pristine_parity:
-            q = q.to(q_dtype)
+        q = rope_apply(q, grid_sizes, freqs).to(q.dtype)
 
         k = self.norm_k(self.k(x)).view(b, s, n, d)
-        k_dtype = k.dtype
-        k = rope_apply(k, grid_sizes, freqs)
-        if not pristine_parity:
-            k = k.to(k_dtype)
+        k = rope_apply(k, grid_sizes, freqs).to(k.dtype)
 
         v = self.v(x).view(b, s, n, d)
 
@@ -505,12 +498,9 @@ class CustomWanAttentionBlock(nn.Module):
 
         # self-attention
 
-        self_input = self.norm1(x).float() * (1 + e[1]) + e[0]
-        if not bias_kwargs.get("_r3_pristine_parity_arithmetic", False):
-            self_input = self_input.to(x.dtype)
         with runtime_observation_scope(attention_site="self"):
             y, generated_simil_masks, used_simil_masks = self.self_attn(
-                self_input,
+                (self.norm1(x).float() * (1 + e[1]) + e[0]).to(x.dtype),
                 seq_lens,
                 grid_sizes,
                 freqs,
@@ -534,10 +524,7 @@ class CustomWanAttentionBlock(nn.Module):
                 bias_kwargs=bias_kwargs,
             )
         x = x + x_cross_attn
-        ffn_input = self.norm2(x).float() * (1 + e[4]) + e[3]
-        if not bias_kwargs.get("_r3_pristine_parity_arithmetic", False):
-            ffn_input = ffn_input.to(x.dtype)
-        y = self.ffn(ffn_input)
+        y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(x.dtype))
 
         with torch.autocast("cuda", dtype=torch.float32):
             x = x + y * e[5]
@@ -792,11 +779,6 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         )
 
         bias_kwargs = bias_kwargs.copy()
-        bias_kwargs.pop("_r3_pristine_parity_arithmetic", None)
-        if getattr(self, "_r3_pristine_parity_arithmetic", False):
-            if bias_kwargs.get("bias_method") != "none":
-                raise ValueError("R3 pristine arithmetic is limited to custom-none")
-            bias_kwargs["_r3_pristine_parity_arithmetic"] = True
         if len(grid_sizes) != 1:
             raise ValueError("custom regional attention currently supports batch size 1")
         T, H, W = [int(s) for s in grid_sizes[0]]
