@@ -981,23 +981,15 @@ class CustomWanModel(ModelMixin, ConfigMixin):
         """
 
         c = self.out_dim
-        p, q, r = self.patch_size
         out = []
 
+        # Keep upstream's einsum: under the generator's BF16 autocast it rounds
+        # the noise prediction to BF16 exactly as WanModel.unpatchify does. A
+        # pure permute (einops) keeps FP32 and breaks custom-none/upstream parity.
         for u, v in zip(x, grid_sizes.tolist(), strict=True):
-            u = u[: math.prod(v)]
-            f, h, w = v
-            u = rearrange(
-                u,
-                "(f h w) (p q r c) -> c (f p) (h q) (w r)",
-                f=f,
-                h=h,
-                w=w,
-                p=p,
-                q=q,
-                r=r,
-                c=c,
-            )
+            u = u[: math.prod(v)].view(*v, *self.patch_size, c)
+            u = torch.einsum("fhwpqrc->cfphqwr", u)
+            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size, strict=True)])
             out.append(u)
 
         return out
