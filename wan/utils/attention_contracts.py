@@ -11,6 +11,7 @@ MASK_SHARING_ALIASES = {
     "block0": "first",
     "prev": "previous_generated",
     "previous-generated": "previous_generated",
+    "previous_generated": "previous_generated",
 }
 
 
